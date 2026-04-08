@@ -1,0 +1,144 @@
+---
+title: "Key Auth"
+description: "Authenticate API requests using API keys passed via request headers or URL query parameters."
+---
+
+The `key-auth` plugin implements authentication based on API keys. It parses the API key from HTTP request URL parameters or request headers, then verifies whether the key is associated with an allowed consumer.
+
+**Execution phase:** Authentication Phase  
+**Execution priority:** `321`
+
+<Note>
+After successful authentication, the request header `X-Mse-Consumer` is added to identify the caller's name, and it is forwarded to the upstream service.
+</Note>
+
+<Warning>
+Authentication configuration and authorization configuration (`allow`) cannot coexist in a single rule. Authentication config belongs at the instance (global) level; authorization config belongs at the route or hostname level.
+</Warning>
+
+## Configuration
+
+### Instance-level fields
+
+<ParamField path="consumers" type="object[]" required>
+  List of service consumers for request authentication. Each consumer has a `name` and a `credential`.
+</ParamField>
+
+<ParamField path="keys" type="string[]" required>
+  Source field names for the API key. Each name can be a URL query parameter name or an HTTP request header name. The plugin looks for the key in these fields.
+</ParamField>
+
+<ParamField path="in_query" type="boolean">
+  When `true`, the gateway attempts to parse the API key from URL query parameters. At least one of `in_query` or `in_header` must be `true`.
+
+  Default: `true`
+</ParamField>
+
+<ParamField path="in_header" type="boolean">
+  When `true`, the gateway attempts to parse the API key from HTTP request headers. At least one of `in_query` or `in_header` must be `true`.
+
+  Default: `true`
+</ParamField>
+
+<ParamField path="global_auth" type="boolean">
+  **Instance-level only.** When `true`, the authentication mechanism applies globally to all requests. When `false`, it only applies to routes or hostnames that have an explicit `allow` configuration. If omitted, the plugin applies globally only when no route or hostname configurations are present.
+</ParamField>
+
+### Consumer object fields
+
+<ParamField path="name" type="string" required>
+  The name of this consumer. Used in the `X-Mse-Consumer` header and in route-level `allow` lists.
+</ParamField>
+
+<ParamField path="credential" type="string" required>
+  The API key value for this consumer. Must be unique across all consumers.
+</ParamField>
+
+### Route/hostname-level fields
+
+<ParamField path="allow" type="string[]">
+  **Route or hostname level only.** List of consumer names permitted to access this route or hostname. Requests authenticated as consumers not in this list are rejected with `403`.
+</ParamField>
+
+## Examples
+
+### Global authentication with per-route authorization
+
+Define consumers at the instance level and restrict which consumers can access specific routes.
+
+**Instance-level configuration:**
+
+```yaml
+global_auth: false
+consumers:
+  - name: consumer1
+    credential: 2bda943c-ba2b-11ec-ba07-00163e1250b5
+  - name: consumer2
+    credential: c8c8e9ca-558e-4a2d-bb62-e700dcc40e35
+keys:
+  - apikey
+  - x-api-key
+in_query: true
+in_header: true
+```
+
+**Route-level configuration for `route-a` and `route-b`:**
+
+```yaml
+allow:
+  - consumer1
+```
+
+**Hostname-level configuration for `*.example.com` and `test.com`:**
+
+```yaml
+allow:
+  - consumer2
+```
+
+With this setup, `consumer1` can access `route-a` and `route-b`, while `consumer2` can access requests matching the configured hostnames.
+
+### Passing the API key
+
+<Tabs>
+  <Tab title="URL query parameter">
+    ```bash
+    curl http://example.com/api?apikey=2bda943c-ba2b-11ec-ba07-00163e1250b5
+    ```
+  </Tab>
+  <Tab title="Request header">
+    ```bash
+    curl http://example.com/api \
+      -H 'x-api-key: 2bda943c-ba2b-11ec-ba07-00163e1250b5'
+    ```
+  </Tab>
+</Tabs>
+
+### Enable globally for all requests
+
+```yaml
+global_auth: true
+consumers:
+  - name: consumer1
+    credential: 2bda943c-ba2b-11ec-ba07-00163e1250b5
+  - name: consumer2
+    credential: c8c8e9ca-558e-4a2d-bb62-e700dcc40e35
+keys:
+  - apikey
+  - x-api-key
+in_query: true
+in_header: true
+```
+
+With `global_auth: true`, all requests must present a valid API key regardless of whether the route has an explicit `allow` list.
+
+## Error codes
+
+| HTTP Status | Error message | Reason |
+|---|---|---|
+| `401` | `Request denied by Key Auth check. Multiple API keys found in request` | More than one API key was found in the request. |
+| `401` | `Request denied by Key Auth check. No API key found in request` | No API key was provided. |
+| `401` | `Request denied by Key Auth check. Invalid API key` | The provided API key does not match any configured consumer. |
+| `403` | `Request denied by Key Auth check. Unauthorized consumer` | The matched consumer is not in the `allow` list for this route or hostname. |
+
+Failed authentication also returns a `WWW-Authenticate: Key realm=MSE Gateway` response header.

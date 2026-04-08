@@ -1,0 +1,139 @@
+---
+title: "WAF"
+description: "Protect against common web attacks including SQL injection and XSS using a ModSecurity-based rule engine with optional OWASP Core Rule Set support."
+---
+
+The `waf` plugin implements a [ModSecurity](http://www.modsecurity.cn/chm/)-based Web Application Firewall (WAF). It inspects incoming requests against user-defined rules and the OWASP Core Rule Set (CRS), blocking suspicious traffic before it reaches the upstream service.
+
+**Execution phase:** Authorization Phase  
+**Execution priority:** `330`
+
+The plugin is built on [Coraza](https://coraza.io/), a Go-native ModSecurity-compatible engine, and includes native support for SQL injection (`SQLi`) and cross-site scripting (`XSS`) detection via optimized libraries.
+
+## Configuration
+
+<ParamField path="useCRS" type="boolean">
+  Enable the [OWASP Core Rule Set v3.3.2](https://github.com/coreruleset/coreruleset/tree/v3.3.2). The CRS provides broad protection against common attack categories including SQL injection, XSS, remote file inclusion, and more.
+
+  Default: `false`
+</ParamField>
+
+<ParamField path="secRules" type="string[]">
+  List of custom ModSecurity directives and rules. Rules follow standard ModSecurity syntax. These rules are applied in addition to the CRS when `useCRS` is enabled.
+
+  See the [ModSecurity reference manual](http://www.modsecurity.cn/chm/) for full rule syntax.
+</ParamField>
+
+## Examples
+
+### Enable OWASP CRS with custom rules
+
+```yaml
+useCRS: true
+secRules:
+  - "SecDebugLogLevel 3"
+  - "SecRuleEngine On"
+  - "SecAction \"id:100,phase:1,pass\""
+  - "SecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""
+  - "SecRule REQUEST_BODY \"@rx maliciouspayload\" \"id:102,phase:2,t:lowercase,deny\""
+```
+
+With this configuration, the following requests are blocked:
+
+```bash
+# Blocked by rule 101 — exact URI match
+curl http://example.com/admin
+
+# Blocked by rule 102 — body pattern match
+curl http://example.com/api -d "maliciouspayload"
+```
+
+### Block SQL injection attempts
+
+```yaml
+useCRS: true
+secRules:
+  - "SecRuleEngine On"
+  - "SecRule ARGS \"@detectSQLi\" \"id:200,phase:2,deny,status:403,msg:'SQL injection detected'\""
+```
+
+### Detection mode without blocking
+
+Use `SecRuleEngine DetectionOnly` to log suspicious requests without denying them. This is useful for testing rules before enforcing them.
+
+```yaml
+useCRS: true
+secRules:
+  - "SecRuleEngine DetectionOnly"
+  - "SecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,log,pass\""
+```
+
+### Whitelist a specific IP or path
+
+Use `SecRule` with `pass` and `ctl:ruleEngine=Off` to exclude specific traffic from rule processing:
+
+```yaml
+useCRS: true
+secRules:
+  - "SecRuleEngine On"
+  - "SecRule REMOTE_ADDR \"@ipMatch 192.168.1.100\" \"id:300,phase:1,pass,nolog,ctl:ruleEngine=Off\""
+  - "SecRule REQUEST_URI \"@beginsWith /health\" \"id:301,phase:1,pass,nolog,ctl:ruleEngine=Off\""
+```
+
+### Adjust paranoia level (CRS)
+
+The OWASP CRS paranoia level controls how aggressively rules are applied. Higher levels catch more attacks but may cause more false positives.
+
+```yaml
+useCRS: true
+secRules:
+  - "SecRuleEngine On"
+  - "SecAction \"id:900000,phase:1,nolog,pass,t:none,setvar:tx.paranoia_level=2\""
+```
+
+<Note>
+The CRS paranoia level ranges from 1 (default, lowest false positive rate) to 4 (most aggressive). Start with level 1 and increase carefully after reviewing your traffic patterns.
+</Note>
+
+## ModSecurity rule syntax reference
+
+Rules follow the pattern:
+
+```
+SecRule VARIABLES OPERATOR "ACTIONS"
+```
+
+Common variables:
+
+| Variable | Description |
+|---|---|
+| `REQUEST_URI` | Full request URI |
+| `REQUEST_BODY` | Request body content |
+| `REQUEST_HEADERS` | All request headers |
+| `ARGS` | All request arguments (query string + body) |
+| `REMOTE_ADDR` | Client IP address |
+
+Common operators:
+
+| Operator | Description |
+|---|---|
+| `@streq` | String equality |
+| `@rx` | Regular expression match |
+| `@detectSQLi` | Built-in SQL injection detection |
+| `@detectXSS` | Built-in XSS detection |
+| `@ipMatch` | IP address or CIDR match |
+| `@beginsWith` | String prefix match |
+
+Common actions:
+
+| Action | Description |
+|---|---|
+| `deny` | Block the request |
+| `pass` | Allow the request to continue |
+| `log` | Log the match |
+| `nolog` | Suppress logging |
+| `status:403` | Set response status code |
+
+<Warning>
+Enabling `useCRS: true` without tuning may block legitimate traffic in some applications. Test with `SecRuleEngine DetectionOnly` before switching to enforcement mode in production.
+</Warning>

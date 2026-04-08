@@ -1,0 +1,358 @@
+---
+title: "AI Proxy"
+description: "Configure Higress as an AI gateway to proxy requests to LLM providers using a unified OpenAI-compatible API."
+---
+
+The `ai-proxy` plugin lets Higress act as a unified AI gateway. Clients send requests using the OpenAI API format, and the plugin translates them to the target provider's native protocol. Supported endpoints include `/v1/chat/completions`, `/v1/messages` (Claude protocol), `/v1/embeddings`, and `/v1/images/generations`.
+
+## How it works
+
+The plugin performs automatic protocol detection:
+
+- Requests to `/v1/chat/completions` use the OpenAI chat format.
+- Requests to `/v1/messages` use the Anthropic Claude format. If the target provider natively supports Claude, the request is forwarded directly; otherwise it is converted to OpenAI protocol first.
+- Requests to `/v1/embeddings` are converted to the provider's embedding protocol.
+- Requests to `/v1/images/generations` are converted to the provider's image generation protocol.
+
+No `protocol` field needs to be configured—the plugin handles protocol negotiation automatically.
+
+## Step 1: Create a backend service
+
+For cloud LLM providers, use a `McpBridge` DNS service to register the provider's API hostname as a Higress upstream:
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: default
+  namespace: higress-system
+spec:
+  registries:
+  - domain: api.openai.com
+    name: openai
+    port: 443
+    type: dns
+```
+
+## Step 2: Create a route
+
+Create an `Ingress` that forwards requests to the registered backend service. The annotations tell Higress to use HTTPS when connecting to the upstream and to set the correct SNI:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    higress.io/backend-protocol: HTTPS
+    higress.io/destination: openai.dns
+    higress.io/proxy-ssl-name: api.openai.com
+    higress.io/proxy-ssl-server-name: "on"
+  name: openai
+  namespace: higress-system
+spec:
+  ingressClassName: higress
+  rules:
+  - host: your-gateway.example.com
+    http:
+      paths:
+      - backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+        path: /
+        pathType: Prefix
+```
+
+## Step 3: Configure the ai-proxy plugin
+
+Attach a `WasmPlugin` to the route with the provider settings. The plugin is scoped to the route via `matchRules`.
+
+<Tabs>
+  <Tab title="OpenAI">
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-proxy-openai
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      provider:
+        type: openai
+        apiTokens:
+          - "sk-your-openai-api-key"
+    ingress:
+    - openai
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:1.0.0
+```
+
+  </Tab>
+  <Tab title="Claude (Anthropic)">
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-proxy-claude
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      provider:
+        type: claude
+        apiTokens:
+          - "sk-ant-your-anthropic-api-key"
+        claudeVersion: "2023-06-01"
+    ingress:
+    - claude
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:1.0.0
+```
+
+  </Tab>
+  <Tab title="Qwen (Tongyi)">
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-proxy-qwen
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      provider:
+        type: qwen
+        apiTokens:
+          - "your-dashscope-api-token"
+        modelMapping:
+          "gpt-4o": "qwen-max"
+          "gpt-4-*": "qwen-max"
+          "gpt-3.5-turbo": "qwen-plus"
+          "*": "qwen-turbo"
+    ingress:
+    - qwen
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:1.0.0
+```
+
+  </Tab>
+</Tabs>
+
+## Step 4: Test with curl
+
+<Tabs>
+  <Tab title="Chat Completions">
+
+```bash
+curl http://your-gateway.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Example response:
+
+```json
+{
+  "id": "chatcmpl-abcdefg1234567890",
+  "object": "chat.completion",
+  "created": 1714807624,
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I help you today?"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 9,
+    "total_tokens": 19
+  }
+}
+```
+
+  </Tab>
+  <Tab title="Streaming">
+
+Add `"stream": true` to receive server-sent events:
+
+```bash
+curl http://your-gateway.example.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Count to 5"}],
+    "stream": true
+  }'
+```
+
+The response is a sequence of `data:` lines, each containing a JSON delta, terminated by `data: [DONE]`.
+
+  </Tab>
+  <Tab title="Embeddings">
+
+```bash
+curl http://your-gateway.example.com/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "text-embedding-3-small",
+    "input": "Hello, world"
+  }'
+```
+
+  </Tab>
+</Tabs>
+
+## Provider reference
+
+<CardGroup cols={2}>
+  <Card title="OpenAI" icon="robot">
+    `type: openai` — Supports chat, embeddings, and image generation. Use `openaiCustomUrl` to point to a custom OpenAI-compatible backend.
+  </Card>
+  <Card title="Azure OpenAI" icon="microsoft">
+    `type: azure` — Requires `azureServiceUrl` with the deployment name and `api-version`. Only one API token is supported.
+  </Card>
+  <Card title="Anthropic Claude" icon="brain">
+    `type: claude` — Native Claude protocol support. Enable `claudeCodeMode: true` to authenticate with Claude Code OAuth tokens.
+  </Card>
+  <Card title="Qwen (Tongyi)" icon="sparkles">
+    `type: qwen` — Enable `qwenEnableSearch: true` for built-in internet search. Supports file IDs via `qwenFileIds`.
+  </Card>
+  <Card title="Google Gemini" icon="google">
+    `type: gemini` — Configure safety settings with `geminiSafetySetting`. Use `apiVersion` to select `v1` or `v1beta`.
+  </Card>
+  <Card title="Google Vertex AI" icon="cloud">
+    `type: vertex` — Three modes: Standard (service account), Express (API key), and OpenAI-compatible. Set `vertexRegion` and `vertexProjectId`.
+  </Card>
+  <Card title="AWS Bedrock" icon="aws">
+    `type: bedrock` — Authenticate with AWS Signature V4 (`awsAccessKey` + `awsSecretKey`) or Bearer token (`apiTokens`). Requires `awsRegion`.
+  </Card>
+  <Card title="DeepSeek" icon="code">
+    `type: deepseek` — No unique fields; configure `apiTokens` and optional `modelMapping`.
+  </Card>
+  <Card title="Groq" icon="bolt">
+    `type: groq` — Supports open models like `llama3-8b-8192`. No unique fields required.
+  </Card>
+  <Card title="Ollama" icon="server">
+    `type: ollama` — For self-hosted models. Requires `ollamaServerHost` and `ollamaServerPort` (default 11434).
+  </Card>
+  <Card title="Hunyuan" icon="sparkles">
+    `type: hunyuan` — Requires `hunyuanAuthId` and `hunyuanAuthKey` for v3 authentication.
+  </Card>
+  <Card title="MiniMax" icon="message">
+    `type: minimax` — When using `abab6.5-chat` or similar models, also set `minimaxGroupId`.
+  </Card>
+</CardGroup>
+
+Other supported providers: `baichuan`, `yi`, `zhipuai`, `groq`, `grok`, `openrouter`, `fireworks`, `baidu` (ERNIE Bot), `ai360`, `mistral`, `stepfun`, `cloudflare`, `spark`, `doubao`, `coze`, `dify`, `together-ai`, `triton`, `vllm`, `generic`.
+
+## Model mapping
+
+The `modelMapping` field lets clients send standard model names and have them translated to the provider's actual model names.
+
+| Pattern type | Example key | Behavior |
+|---|---|---|
+| Exact match | `"gpt-4o"` | Maps only that model name |
+| Prefix wildcard | `"gpt-4-*"` | Matches all names starting with `gpt-4-` |
+| Global fallback | `"*"` | Matches any unmapped model |
+| Preserve original | `""` (empty string value) | Passes the original model name through |
+
+Example for routing gpt-style names to Qwen models:
+
+```yaml
+modelMapping:
+  "gpt-4o": "qwen-max"
+  "gpt-4-*": "qwen-max"
+  "gpt-35-turbo": "qwen-plus"
+  "*": "qwen-turbo"
+```
+
+## Failover configuration
+
+When multiple `apiTokens` are configured, the plugin selects one at random per request. You can also enable an active failover mechanism that tracks token health and automatically removes failing tokens from the pool.
+
+```yaml
+provider:
+  type: openai
+  apiTokens:
+    - "sk-token-1"
+    - "sk-token-2"
+    - "sk-token-3"
+  failover:
+    enabled: true
+    failureThreshold: 3         # Consecutive failures before marking unhealthy
+    successThreshold: 1         # Successes before marking healthy again
+    healthCheckInterval: 5000   # Health check interval in milliseconds
+    healthCheckTimeout: 5000    # Health check timeout in milliseconds
+    healthCheckModel: "gpt-4o-mini"
+    failoverOnStatus:
+      - "429"
+      - "5.*"                   # Regex patterns are supported
+```
+
+<Note>
+Failover state is shared across all Wasm VM instances via Envoy shared data, so a token marked unhealthy in one instance is removed from the pool everywhere.
+</Note>
+
+## Custom parameters
+
+Use `customSettings` to inject or override request parameters before forwarding to the provider:
+
+```yaml
+provider:
+  type: openai
+  apiTokens:
+    - "sk-your-key"
+  customSettings:
+    - name: max_tokens
+      value: 2048
+      overwrite: false   # Only set if not already present in the request
+    - name: temperature
+      value: 0.7
+      overwrite: true    # Always override
+```
+
+The `name` field uses a normalized mapping across providers — for example, `max_tokens` maps to `maxOutputTokens` for Gemini and `tokens_to_generate` for MiniMax automatically. Set `mode: raw` to bypass the mapping and write the parameter name literally.
+
+## Context from files
+
+To inject context from a file URL into every AI conversation:
+
+```yaml
+provider:
+  type: qwen
+  apiTokens:
+    - "YOUR_QWEN_API_TOKEN"
+  modelMapping:
+    "*": "qwen-turbo"
+  context:
+    fileUrl: "http://file.default.svc.cluster.local/ai/context.txt"
+    serviceName: "file.dns"
+    servicePort: 80
+```
+
+## Context cleanup commands
+
+Configure commands that, when sent as a user message, clear the conversation history:
+
+```yaml
+provider:
+  type: qwen
+  apiTokens:
+    - "YOUR_QWEN_API_TOKEN"
+  contextCleanupCommands:
+    - "clear context"
+    - "/clear"
+    - "start over"
+```
+
+When a message exactly matches one of these commands, the plugin removes the command and all preceding non-system messages, while preserving system messages and any messages after the command.

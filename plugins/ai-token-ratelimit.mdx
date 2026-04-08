@@ -1,0 +1,376 @@
+---
+title: "AI Token Rate Limit"
+description: "Rate limit LLM API usage by token count, supporting per-consumer, per-route, per-IP, and global limiting modes backed by Redis."
+---
+
+The `ai-token-ratelimit` plugin implements AI token rate limiting based on Redis. It supports two modes:
+
+- **Global rate limiting**: A shared token budget across all requests matching the same rule.
+- **Key-level rate limiting**: Per-key token budgets based on request headers, URL parameters, client IP, consumer name, or cookie values.
+
+<Note>
+  This plugin depends on the `ai-statistics` plugin to count tokens consumed per request. The `ai-statistics` plugin must also be configured.
+</Note>
+
+## Execution properties
+
+| Property | Value |
+|---|---|
+| Execution phase | Default Phase |
+| Priority | 600 |
+
+## Configuration
+
+<ParamField path="rule_name" type="string" required>
+  Name of the rate limiting rule. The Redis key is assembled from `rule_name` + rate limiting type + key name + key value.
+</ParamField>
+
+<ParamField path="global_threshold" type="object">
+  Sets a global token budget for all requests matching this rule. Required if `rule_items` is not configured.
+</ParamField>
+
+<ParamField path="rule_items" type="array of object">
+  Per-key rate limiting rules. Rules are evaluated in order; the first matching rule is applied and subsequent rules are skipped. Required if `global_threshold` is not configured.
+</ParamField>
+
+<ParamField path="rejected_code" type="integer">
+  HTTP status code returned when a request is rate-limited. Defaults to `429`.
+</ParamField>
+
+<ParamField path="rejected_msg" type="string">
+  Response body returned when a request is rate-limited. Defaults to `Too many requests`.
+</ParamField>
+
+<ParamField path="redis" type="object" required>
+  Redis connection configuration. See [Redis fields](#redis-fields).
+</ParamField>
+
+### `global_threshold` fields
+
+At least one of the following is required:
+
+<ParamField path="global_threshold.token_per_second" type="integer">
+  Maximum tokens allowed per second across the entire rule group.
+</ParamField>
+
+<ParamField path="global_threshold.token_per_minute" type="integer">
+  Maximum tokens allowed per minute across the entire rule group.
+</ParamField>
+
+<ParamField path="global_threshold.token_per_hour" type="integer">
+  Maximum tokens allowed per hour across the entire rule group.
+</ParamField>
+
+<ParamField path="global_threshold.token_per_day" type="integer">
+  Maximum tokens allowed per day across the entire rule group.
+</ParamField>
+
+### `rule_items` fields
+
+Each item in `rule_items` must include exactly one `limit_by_*` key and a `limit_keys` array.
+
+<ParamField path="limit_by_header" type="string">
+  Rate limits by the value of the specified HTTP request header. All matching values share a single budget.
+</ParamField>
+
+<ParamField path="limit_by_param" type="string">
+  Rate limits by the value of the specified URL query parameter. All matching values share a single budget.
+</ParamField>
+
+<ParamField path="limit_by_consumer" type="string">
+  Rate limits by the authenticated consumer name. All matching consumers share a single budget.
+</ParamField>
+
+<ParamField path="limit_by_cookie" type="string">
+  Rate limits by the value of the specified cookie key. All matching values share a single budget.
+</ParamField>
+
+<ParamField path="limit_by_per_header" type="string">
+  Rate limits each distinct value of the specified HTTP request header separately. Supports regular expressions and `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_by_per_param" type="string">
+  Rate limits each distinct value of the specified URL query parameter separately. Supports regular expressions and `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_by_per_consumer" type="string">
+  Rate limits each distinct consumer name separately. Supports regular expressions and `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_by_per_cookie" type="string">
+  Rate limits each distinct cookie value separately. Supports regular expressions and `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_by_per_ip" type="string">
+  Rate limits each distinct IP separately. Configured as `from-header-<header-name>` to extract the IP from a header (e.g., `from-header-x-forwarded-for`), or `from-remote-addr` for the peer socket IP. Supports IP addresses, CIDR blocks, and `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_keys" type="array of object" required>
+  Key-value pairs defining token budgets for matched values. See [limit_keys fields](#limit_keys-fields).
+</ParamField>
+
+### `limit_keys` fields
+
+<ParamField path="limit_keys[].key" type="string" required>
+  The value to match against.
+
+  - For `limit_by_per_*` types: supports exact strings, regular expressions prefixed with `regexp:` (e.g., `regexp:^a.*`), or `*` as a fallback wildcard.
+  - For `limit_by_per_ip`: supports exact IPs or CIDR notation (e.g., `1.1.1.0/24`). Use `0.0.0.0/0` as a fallback.
+</ParamField>
+
+<ParamField path="limit_keys[].token_per_second" type="integer">
+  Maximum tokens allowed per second for this key.
+</ParamField>
+
+<ParamField path="limit_keys[].token_per_minute" type="integer">
+  Maximum tokens allowed per minute for this key.
+</ParamField>
+
+<ParamField path="limit_keys[].token_per_hour" type="integer">
+  Maximum tokens allowed per hour for this key.
+</ParamField>
+
+<ParamField path="limit_keys[].token_per_day" type="integer">
+  Maximum tokens allowed per day for this key.
+</ParamField>
+
+### Redis fields
+
+<ParamField path="redis.service_name" type="string" required>
+  Full FQDN of the Redis service including service type, e.g., `my-redis.dns` or `redis.my-ns.svc.cluster.local`.
+</ParamField>
+
+<ParamField path="redis.service_port" type="integer">
+  Redis service port. Defaults to `80` for static services and `6379` for others.
+</ParamField>
+
+<ParamField path="redis.username" type="string">
+  Redis username.
+</ParamField>
+
+<ParamField path="redis.password" type="string">
+  Redis password.
+</ParamField>
+
+<ParamField path="redis.timeout" type="integer">
+  Redis connection timeout in milliseconds. Defaults to `1000`.
+</ParamField>
+
+<ParamField path="redis.database" type="integer">
+  Redis database ID. Defaults to `0`. Configuring `1` corresponds to `SELECT 1`.
+</ParamField>
+
+## Configuration examples
+
+### Global token limit for a rule group
+
+```yaml
+rule_name: routeA-global-limit-rule
+global_threshold:
+  token_per_minute: 1000
+redis:
+  service_name: redis.static
+```
+
+### Per-consumer token limit
+
+```yaml
+rule_name: default_rule
+rule_items:
+  - limit_by_consumer: ''
+    limit_keys:
+      - key: consumer1
+        token_per_second: 10
+      - key: consumer2
+        token_per_hour: 100
+  - limit_by_per_consumer: ''
+    limit_keys:
+      - key: "regexp:^premium.*"
+        token_per_minute: 5000
+      - key: "*"
+        token_per_hour: 1000
+redis:
+  service_name: redis.static
+```
+
+### Per-IP token limit
+
+```yaml
+rule_name: default_rule
+rule_items:
+  - limit_by_per_ip: from-header-x-forwarded-for
+    limit_keys:
+      - key: 192.168.1.100
+        token_per_day: 10
+      - key: 10.0.0.0/8
+        token_per_day: 100
+      # Fallback for all other IPs
+      - key: 0.0.0.0/0
+        token_per_day: 1000
+redis:
+  service_name: redis.static
+```
+
+### Per-parameter token limit
+
+```yaml
+rule_name: default_rule
+rule_items:
+  - limit_by_param: apikey
+    limit_keys:
+      - key: 9a342114-ba8a-11ec-b1bf-00163e1250b5
+        token_per_minute: 10
+      - key: a6a6d7f2-ba8a-11ec-bec2-00163e1250b5
+        token_per_hour: 100
+  - limit_by_per_param: apikey
+    limit_keys:
+      - key: "regexp:^a.*"
+        token_per_second: 10
+      - key: "regexp:^b.*"
+        token_per_minute: 100
+      - key: "*"
+        token_per_hour: 1000
+redis:
+  service_name: redis.static
+```
+
+### Per-header token limit
+
+```yaml
+rule_name: default_rule
+rule_items:
+  - limit_by_header: x-ca-key
+    limit_keys:
+      - key: "102234"
+        token_per_minute: 10
+      - key: "308239"
+        token_per_hour: 10
+  - limit_by_per_header: x-ca-key
+    limit_keys:
+      - key: "regexp:^a.*"
+        token_per_second: 10
+      - key: "*"
+        token_per_hour: 1000
+redis:
+  service_name: redis.static
+```
+
+### Custom rejection response
+
+```yaml
+rule_name: default_rule
+rule_items:
+  - limit_by_per_cookie: session_id
+    limit_keys:
+      - key: "*"
+        token_per_hour: 500
+rejected_code: 200
+rejected_msg: '{"code":-1,"msg":"Token limit exceeded, please try again later"}'
+redis:
+  service_name: redis.static
+```
+
+## Full Kubernetes deployment example
+
+This example limits the `apikey=123456` parameter to 200 tokens per minute using Qwen as the AI backend.
+
+**Deploy Redis:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: redis
+```
+
+**Configure plugins:**
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-proxy
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      provider:
+        type: qwen
+        apiTokens:
+        - "<YOUR_API_TOKEN>"
+        modelMapping:
+          "gpt-3": "qwen-turbo"
+          "*": "qwen-turbo"
+    ingress:
+    - qwen
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:1.0.0
+  phase: UNSPECIFIED_PHASE
+  priority: 100
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-token-ratelimit
+  namespace: higress-system
+spec:
+  defaultConfig:
+    rule_name: default_limit_by_param_apikey
+    rule_items:
+    - limit_by_param: apikey
+      limit_keys:
+      - key: 123456
+        token_per_minute: 200
+    redis:
+      service_name: redis.dns
+      service_port: 6379
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-token-ratelimit:1.0.0
+  phase: UNSPECIFIED_PHASE
+  priority: 600
+```
+
+**Test the rate limit:**
+
+```bash
+# First request — succeeds
+curl "http://localhost:18000/v1/chat/completions?apikey=123456" \
+  -H "Host: qwen-test.com" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-3",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": false
+  }'
+
+# After limit is reached — rejected
+# Response: Too many requests
+```

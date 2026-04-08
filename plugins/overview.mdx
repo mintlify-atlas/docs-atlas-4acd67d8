@@ -1,0 +1,280 @@
+---
+title: "Plugin system overview"
+description: "How Higress Wasm plugins work, what languages are supported, and the official plugin library available out of the box."
+---
+
+Higress plugins run as WebAssembly (Wasm) modules inside Envoy's sandbox. They extend gateway behavior without restarts or traffic drops. Plugins are loaded via the `WasmPlugin` CRD and can be applied globally, per domain, or per route.
+
+## Supported languages
+
+| Language | SDK | Notes |
+|---|---|---|
+| **Go** | `github.com/higress-group/wasm-go` | Primary SDK; most official plugins use Go |
+| **Rust** | `higress-wasm-rust` | Full-featured SDK with rule matching and Redis support |
+| **JavaScript / AssemblyScript** | proxy-wasm-as | Lighter alternative |
+| **C++** | proxy-wasm-cpp-sdk | Used by some legacy built-in plugins |
+
+## Plugin execution phases
+
+Each request and response passes through four phases. Your plugin registers handlers for the phases it needs.
+
+| Phase | Hook (Go) | Hook (Rust) |
+|---|---|---|
+| Request headers received | `ProcessRequestHeaders` | `on_http_request_headers` |
+| Request body received | `ProcessRequestBody` | `on_http_request_body` |
+| Response headers received | `ProcessResponseHeaders` | `on_http_response_headers` |
+| Response body received | `ProcessResponseBody` | `on_http_response_body` |
+
+Streaming response bodies can be intercepted chunk by chunk using `ProcessStreamingResponseBody` (Go) without buffering the full response.
+
+## Plugin scopes
+
+A single `WasmPlugin` resource can apply different configurations at different scopes. Rules are evaluated in order; the first match wins.
+
+| Scope | `matchRules` key | Example |
+|---|---|---|
+| Global (default) | `defaultConfig` | Applied to all requests not matched by a rule |
+| Route (Ingress) | `ingress` | `default/my-ingress` |
+| Domain | `domain` | `*.example.com` |
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: request-block
+  namespace: higress-system
+spec:
+  defaultConfig:
+    block_urls:
+    - "swagger.html"
+  matchRules:
+  - ingress:
+    - default/foo
+    config:
+      block_urls:
+      - "admin"
+  - domain:
+    - "*.internal.example.com"
+    config:
+      block_urls:
+      - "debug"
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/request-block:1.0.0
+```
+
+## WasmPlugin CRD
+
+The `WasmPlugin` CRD (API version `extensions.higress.io/v1alpha1`) is the primary way to load a plugin. Key fields:
+
+| Field | Description |
+|---|---|
+| `spec.url` | OCI image URL or local `file://` path to the `.wasm` binary |
+| `spec.defaultConfig` | Plugin configuration applied globally |
+| `spec.matchRules` | List of scope-specific configuration overrides |
+| `spec.selector` | Label selector to target specific gateway pods |
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: key-auth
+  namespace: higress-system
+spec:
+  selector:
+    matchLabels:
+      higress: higress-system-higress-gateway
+  defaultConfig:
+    consumers:
+    - credential: my-api-key
+      name: consumer-a
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/key-auth:1.0.0
+```
+
+## Deploying a plugin
+
+<Steps>
+  <Step title="Build or pull the plugin image">
+    Use the official registry or build your own. Official images follow the pattern:
+
+    ```
+    oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/<name>:<version>
+    ```
+  </Step>
+  <Step title="Apply the WasmPlugin resource">
+    ```bash
+    kubectl apply -f my-plugin.yaml
+    ```
+
+    Configuration changes take effect within milliseconds with no connection loss.
+  </Step>
+  <Step title="Verify the plugin is loaded">
+    ```bash
+    kubectl get wasmplugin -n higress-system
+    kubectl describe wasmplugin my-plugin -n higress-system
+    ```
+  </Step>
+</Steps>
+
+<Note>
+All official plugin images are hosted at `higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/`. You can also push your own images to any OCI-compatible registry.
+</Note>
+
+## Official plugin library
+
+The following plugins ship with Higress and are available directly from the official registry.
+
+### AI plugins
+
+<CardGroup cols={2}>
+  <Card title="ai-proxy" icon="robot" href="/plugins/ai-proxy">
+    Unified proxy for all mainstream LLM providers (OpenAI, Anthropic, Gemini, and more). Protocol conversion, API key management, and retry on failure.
+  </Card>
+  <Card title="ai-cache" icon="database" href="/plugins/ai-cache">
+    Semantic caching for LLM responses. Reduces latency and cost by returning cached answers for semantically equivalent prompts.
+  </Card>
+  <Card title="ai-token-ratelimit" icon="gauge" href="/plugins/ai-token-ratelimit">
+    Token-based rate limiting for LLM APIs. Limits by input/output token counts rather than raw request counts.
+  </Card>
+  <Card title="ai-security-guard" icon="shield" href="/plugins/ai-security-guard">
+    Content moderation for AI requests and responses. Blocks harmful, sensitive, or policy-violating content.
+  </Card>
+  <Card title="ai-prompt-decorator" icon="pen-to-square">
+    Prepend or append system and user prompts to LLM requests. Useful for injecting context or guardrails.
+  </Card>
+  <Card title="ai-prompt-template" icon="file-code">
+    Define reusable prompt templates with variable substitution for LLM requests.
+  </Card>
+  <Card title="ai-statistics" icon="chart-line">
+    Collect first-token latency, token usage, and model metadata for observability.
+  </Card>
+  <Card title="ai-history" icon="clock-rotate-left">
+    Maintain conversation history for multi-turn LLM interactions.
+  </Card>
+  <Card title="ai-intent" icon="brain">
+    Classify user intent using an LLM. Attach the intent label to requests for downstream routing.
+  </Card>
+  <Card title="ai-load-balancer" icon="arrows-split-up-and-left">
+    Load balance across multiple LLM provider endpoints with health checking and failover.
+  </Card>
+  <Card title="ai-rag" icon="magnifying-glass">
+    Retrieval-augmented generation. Fetches relevant context from a vector store before sending requests to the LLM.
+  </Card>
+  <Card title="model-router" icon="route" href="/plugins/model-router">
+    Route requests to different LLM models based on request content, headers, or custom rules.
+  </Card>
+  <Card title="mcp-router" icon="server" href="/plugins/mcp-router">
+    Route Model Context Protocol (MCP) requests to registered MCP servers.
+  </Card>
+  <Card title="ai-quota" icon="coins">
+    Per-consumer quota management for AI API usage.
+  </Card>
+  <Card title="ai-transformer" icon="shuffle">
+    Transform request and response bodies for AI APIs using configurable rules.
+  </Card>
+  <Card title="ai-json-resp" icon="brackets-curly">
+    Enforce structured JSON output from LLM responses.
+  </Card>
+  <Card title="ai-agent" icon="microchip">
+    Enable LLM-powered agents to invoke tools and services through the gateway.
+  </Card>
+  <Card title="ai-search" icon="search">
+    Augment LLM requests with real-time search results.
+  </Card>
+</CardGroup>
+
+### Authentication
+
+<CardGroup cols={2}>
+  <Card title="key-auth" icon="key" href="/plugins/key-auth">
+    API key authentication. Validates keys from request headers or query parameters.
+  </Card>
+  <Card title="jwt-auth" icon="id-card" href="/plugins/jwt-auth">
+    JWT token validation with support for RS256, HS256, and custom claims.
+  </Card>
+  <Card title="basic-auth" icon="lock">
+    HTTP Basic authentication.
+  </Card>
+  <Card title="hmac-auth" icon="signature">
+    HMAC-based request signing and verification.
+  </Card>
+  <Card title="oidc" icon="arrow-right-arrow-left">
+    OpenID Connect authentication. Integrates with any OIDC-compliant identity provider.
+  </Card>
+  <Card title="ext-auth" icon="shield-check">
+    Delegate authentication decisions to an external HTTP service.
+  </Card>
+  <Card title="opa" icon="gavel">
+    Policy-based authorization using Open Policy Agent.
+  </Card>
+  <Card title="simple-jwt-auth" icon="id-badge">
+    Lightweight JWT validation without an external JWKS endpoint.
+  </Card>
+</CardGroup>
+
+### Traffic management
+
+<CardGroup cols={2}>
+  <Card title="cors" icon="arrows-left-right" href="/plugins/cors">
+    Cross-origin resource sharing (CORS) headers management.
+  </Card>
+  <Card title="transformer" icon="arrow-right-arrow-left">
+    Add, remove, and rewrite request and response headers and bodies.
+  </Card>
+  <Card title="traffic-tag" icon="tag">
+    Tag requests with custom metadata for routing, canary releases, or A/B testing.
+  </Card>
+  <Card title="cluster-key-rate-limit" icon="gauge-high" href="/plugins/rate-limiting">
+    Distributed rate limiting keyed on arbitrary request attributes.
+  </Card>
+  <Card title="custom-response" icon="message">
+    Return a static or templated response without forwarding to the upstream.
+  </Card>
+  <Card title="cache-control" icon="clock">
+    Add and manage HTTP cache-control headers.
+  </Card>
+  <Card title="response-cache" icon="hard-drive">
+    Cache upstream responses and serve them to subsequent matching requests.
+  </Card>
+  <Card title="frontend-gray" icon="code-branch">
+    Canary traffic splitting for frontend deployments based on cookies or headers.
+  </Card>
+  <Card title="de-graphql" icon="diagram-project">
+    Convert RESTful requests to GraphQL queries.
+  </Card>
+  <Card title="geo-ip" icon="earth-americas">
+    Attach geographic information (country, region, city) to requests based on client IP.
+  </Card>
+</CardGroup>
+
+### Security
+
+<CardGroup cols={2}>
+  <Card title="waf" icon="shield-halved" href="/plugins/waf">
+    Web Application Firewall using ModSecurity rule sets.
+  </Card>
+  <Card title="ip-restriction" icon="ban">
+    Allow or deny requests based on client IP addresses or CIDR ranges.
+  </Card>
+  <Card title="bot-detect" icon="robot">
+    Detect and block web crawlers and bots based on User-Agent patterns.
+  </Card>
+  <Card title="replay-protection" icon="repeat">
+    Prevent replay attacks by rejecting requests with duplicate nonce values.
+  </Card>
+  <Card title="request-block" icon="circle-minus">
+    Block requests matching URL patterns, headers, or body content.
+  </Card>
+  <Card title="request-validation" icon="circle-check">
+    Validate request parameters and bodies against a JSON Schema.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Write a Go plugin" icon="golang" href="/plugins/wasm-go">
+    Step-by-step guide to writing, building, and deploying a Wasm plugin in Go.
+  </Card>
+  <Card title="Write a Rust plugin" icon="gear" href="/plugins/wasm-rust">
+    Step-by-step guide to writing, building, and deploying a Wasm plugin in Rust.
+  </Card>
+</CardGroup>

@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Higress",
+  "projectType": "infrastructure",
+  "projectName": "Higress",
+  "projectDescription": "A cloud-native AI Gateway and API Gateway built on Envoy and Istio, supporting LLM proxy, MCP server hosting, Kubernetes ingress, and Wasm plugin extensions.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#343c44",
-    "light": "#0726fc",
-    "dark": "#343c44"
-  },
-  "favicon": "https://media.brand.dev/3acd959d-475b-4584-a966-9cfbf2f8ba30.png",
-  "logo": {
-    "light": "https://media.brand.dev/02be4a5f-1ed8-450e-91b8-e9a895d0468e.svg",
-    "dark": "https://media.brand.dev/02be4a5f-1ed8-450e-91b8-e9a895d0468e.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/alibaba/higress"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/alibaba/higress"
-    }
-  },
+  "primaryColor": "#343c44",
+  "lightColor": "#0726fc",
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -101,5 +84,29 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "AI Gateway with unified LLM API proxy supporting 40+ model providers",
+    "MCP (Model Context Protocol) Server hosting for AI Agents",
+    "Kubernetes Ingress Controller with Gateway API support",
+    "Wasm plugin system supporting Go, Rust, and JavaScript",
+    "Token-based rate limiting and AI observability",
+    "Built-in WAF and authentication plugins (key-auth, JWT, OIDC)",
+    "Zero-reload hot configuration updates via Envoy xDS",
+    "Streaming SSE support with minimal memory overhead",
+    "Microservice gateway with Nacos/ZooKeeper/Consul service discovery"
+  ],
+  "publicApiSurface": [
+    "POST /v1/chat/completions (OpenAI-compatible LLM API)",
+    "POST /v1/messages (Claude-compatible LLM API)",
+    "POST /v1/embeddings (Embeddings API)",
+    "POST /v1/images/generations (Image generation API)",
+    "Wasm Plugin SDK (Go: github.com/higress-group/proxy-wasm-go-sdk)",
+    "hgctl CLI (install, upgrade, config, plugin, dashboard)",
+    "Helm chart: higress.io/higress",
+    "WasmPlugin CRD",
+    "McpBridge CRD",
+    "Http2Rpc CRD",
+    "Ingress API / Gateway API"
+  ]
 }

@@ -1,0 +1,148 @@
+---
+title: "Model Router"
+description: "Route LLM requests to different backends based on the model name in the request body. Supports header-based routing and provider extraction from model names."
+---
+
+The `model-router` plugin routes LLM requests by inspecting the `model` parameter in the request body. It extracts the model name (and optionally a provider prefix) and writes them to request headers, enabling header-based routing rules to send requests to the appropriate backend.
+
+## Execution properties
+
+| Property | Value |
+|---|---|
+| Execution phase | Authentication Phase |
+| Priority | 900 |
+
+## Configuration
+
+<ParamField path="modelKey" type="string">
+  JSON path to the model parameter in the request body. Defaults to `model`.
+</ParamField>
+
+<ParamField path="addProviderHeader" type="string">
+  Request header to populate with the provider name extracted from the model parameter. The provider is parsed from the `provider/model-name` format in the request body. The model parameter in the request body is rewritten to contain only the model name (prefix removed). If no provider prefix is present in the model name, no header is added.
+</ParamField>
+
+<ParamField path="modelToHeader" type="string">
+  Request header to populate with the full model parameter value (unchanged). Use this for routing on the complete model string.
+</ParamField>
+
+<ParamField path="enableOnPathSuffix" type="array of string">
+  Path suffixes for which this plugin is active. Defaults to `["/completions", "/embeddings", "/images/generations", "/audio/speech", "/fine_tuning/jobs", "/moderations", "/image-synthesis", "/video-synthesis", "/rerank", "/messages"]`. Configure as `["*"]` to match all paths.
+</ParamField>
+
+## Routing modes
+
+### Route by model name
+
+Set `modelToHeader` to write the exact model name to a request header. Downstream routing rules can then match on this header.
+
+**Configuration:**
+
+```yaml
+modelToHeader: x-higress-llm-model
+```
+
+**Input request body:**
+
+```json
+{
+  "model": "qwen-long",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+**Header added by the plugin:**
+
+```
+x-higress-llm-model: qwen-long
+```
+
+The request body is not modified.
+
+### Route by provider prefix
+
+Set `addProviderHeader` to extract a provider prefix from the model name. The client encodes the provider in the model string using `/` as the separator.
+
+**Configuration:**
+
+```yaml
+addProviderHeader: x-higress-llm-provider
+```
+
+**Input request body:**
+
+```json
+{
+  "model": "dashscope/qwen-long",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+**Header added by the plugin:**
+
+```
+x-higress-llm-provider: dashscope
+```
+
+**Request body after plugin processing:**
+
+```json
+{
+  "model": "qwen-long",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+The `provider/` prefix is stripped from the model field before the request is forwarded upstream.
+
+<Note>
+  Provider-based routing requires clients to use the `provider/model-name` format in the `model` field. If the model name contains no `/`, no provider header is added and the request body is not modified.
+</Note>
+
+## Usage examples
+
+### Routing different models to different backends
+
+Combine `modelToHeader` with Higress route matching rules to send requests to different upstreams based on the model name.
+
+**Plugin configuration:**
+
+```yaml
+modelToHeader: x-higress-llm-model
+```
+
+**Route rules (conceptual):**
+
+- Requests with `x-higress-llm-model: gpt-4*` → OpenAI backend
+- Requests with `x-higress-llm-model: claude-*` → Anthropic backend
+- Requests with `x-higress-llm-model: qwen-*` → Alibaba Cloud backend
+
+### Multi-provider endpoint
+
+Use `addProviderHeader` to allow a single endpoint to serve multiple providers, with clients specifying their desired provider in the model field:
+
+**Plugin configuration:**
+
+```yaml
+addProviderHeader: x-higress-llm-provider
+```
+
+**Client request to route to Qwen:**
+
+```json
+{
+  "model": "dashscope/qwen-max",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+**Client request to route to OpenAI:**
+
+```json
+{
+  "model": "openai/gpt-4o",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+Route matching rules on `x-higress-llm-provider` then forward each request to the correct backend.

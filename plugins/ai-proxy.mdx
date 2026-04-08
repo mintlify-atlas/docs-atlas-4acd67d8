@@ -1,0 +1,569 @@
+---
+title: "AI Proxy"
+description: "Unified LLM API proxy supporting OpenAI, Claude, and other protocols. Converts and routes requests to 30+ AI service providers."
+---
+
+The `ai-proxy` plugin implements AI proxy functionality based on the OpenAI API contract. It supports automatic protocol detection for both OpenAI and Claude formats and proxies requests to a wide range of AI service providers.
+
+## Auto protocol detection
+
+The plugin detects the request path and handles protocol conversion automatically — no `protocol` field configuration is required.
+
+| Path suffix | Behavior |
+|---|---|
+| `/v1/chat/completions` | Parsed as OpenAI text-to-text; converted to the target provider's protocol |
+| `/v1/messages` | Parsed as Claude Messages API; forwarded natively if supported, otherwise converted to OpenAI |
+| `/v1/embeddings` | Parsed as OpenAI embeddings; converted to target provider's embeddings protocol |
+| `/v1/images/generations` | Parsed as OpenAI image generation; converted to target provider's image generation protocol |
+
+## Execution properties
+
+| Property | Value |
+|---|---|
+| Execution phase | Default Phase |
+| Priority | 100 |
+
+## Configuration
+
+### Top-level fields
+
+<ParamField path="provider" type="object" required>
+  Configuration for the target AI service provider. See provider fields below.
+</ParamField>
+
+### `provider` fields
+
+<ParamField path="provider.type" type="string" required>
+  Name of the AI service provider. See [Supported providers](#supported-providers) for all valid values.
+</ParamField>
+
+<ParamField path="provider.apiTokens" type="array of string">
+  Authentication tokens for the AI service. If multiple tokens are configured, one is chosen randomly per request. Some providers only support a single token.
+</ParamField>
+
+<ParamField path="provider.timeout" type="number">
+  Timeout in milliseconds for accessing AI services. Defaults to `120000` (2 minutes). This applies only when retrieving context data and does not affect the request forwarded to the LLM upstream.
+</ParamField>
+
+<ParamField path="provider.modelMapping" type="map of string">
+  Maps model names in requests to names supported by the provider.
+
+  - Supports prefix matching: `"gpt-3-*"` matches all model names starting with `gpt-3-`
+  - Use `"*"` as a key for a general fallback mapping
+  - Setting the mapped value to `""` preserves the original model name
+</ParamField>
+
+<ParamField path="provider.protocol" type="string">
+  API contract used by the plugin. Supported values: `openai` (default), `original` (uses the provider's native interface). Auto protocol detection is active by default; this field is only needed to force `original` mode.
+</ParamField>
+
+<ParamField path="provider.context" type="object">
+  Configuration for AI conversation context loaded from an external file. Cannot be used together with `moonshotFileId` or `qwenFileIds`.
+</ParamField>
+
+<ParamField path="provider.customSettings" type="array of object">
+  Overrides or fills parameters in AI requests. See [Custom settings](#custom-settings).
+</ParamField>
+
+<ParamField path="provider.subPath" type="string">
+  If configured, this prefix is stripped from the request path before further processing.
+</ParamField>
+
+<ParamField path="provider.contextCleanupCommands" type="array of string">
+  List of commands that, when matched exactly in a user message, remove that message and all preceding non-system messages. System messages are always preserved.
+</ParamField>
+
+### `provider.context` fields
+
+<ParamField path="provider.context.fileUrl" type="string" required>
+  URL of a plain-text file to use as conversation context.
+</ParamField>
+
+<ParamField path="provider.context.serviceName" type="string" required>
+  Full name of the Higress backend service corresponding to the URL.
+</ParamField>
+
+<ParamField path="provider.context.servicePort" type="number" required>
+  Port for accessing the Higress backend service corresponding to the URL.
+</ParamField>
+
+### Custom settings
+
+Each entry in `provider.customSettings` has these fields:
+
+<ParamField path="name" type="string" required>
+  Parameter name to set (e.g., `max_tokens`, `temperature`). The name is automatically rewritten to match the target protocol unless `mode` is `raw`.
+</ParamField>
+
+<ParamField path="value" type="string | number | boolean" required>
+  Value to set for the parameter.
+</ParamField>
+
+<ParamField path="mode" type="string">
+  How the parameter name is handled. `auto` (default) rewrites the name based on the target protocol. `raw` applies the name and value directly with no restrictions.
+</ParamField>
+
+<ParamField path="overwrite" type="boolean">
+  If `true` (default), overrides any value already set by the user. If `false`, the parameter is only filled if the user has not set it.
+</ParamField>
+
+The following table shows how `name` values map to each provider's protocol field:
+
+| settingName | openai | baidu | spark | qwen | gemini | hunyuan | claude | minimax |
+|---|---|---|---|---|---|---|---|---|
+| `max_tokens` | `max_tokens` | `max_output_tokens` | `max_tokens` | `max_tokens` | `maxOutputTokens` | none | `max_tokens` | `tokens_to_generate` |
+| `temperature` | `temperature` | `temperature` | `temperature` | `temperature` | `temperature` | `Temperature` | `temperature` | `temperature` |
+| `top_p` | `top_p` | `top_p` | none | `top_p` | `topP` | `TopP` | `top_p` | `top_p` |
+| `top_k` | none | none | `top_k` | none | `topK` | none | `top_k` | none |
+| `seed` | `seed` | none | none | `seed` | none | none | none | none |
+
+<Note>
+  For `qwen`, custom settings are placed under the `parameters` subpath. For `gemini`, they are placed under `generation_config`. In `raw` mode, the JSON content is modified directly at the root path.
+</Note>
+
+## Supported providers
+
+The following provider types are available:
+
+| `provider.type` | Provider |
+|---|---|
+| `openai` | OpenAI |
+| `azure` | Azure OpenAI |
+| `claude` | Anthropic Claude |
+| `qwen` | Alibaba Cloud Tongyi Qwen |
+| `moonshot` | Moonshot AI |
+| `baidu` | Baidu ERNIE Bot |
+| `zhipuai` | Zhipu AI |
+| `deepseek` | DeepSeek |
+| `yi` | Yi (Zero One Universe) |
+| `baichuan` | Baichuan AI |
+| `minimax` | MiniMax |
+| `mistral` | Mistral |
+| `groq` | Groq |
+| `grok` | Grok (xAI) |
+| `openrouter` | OpenRouter |
+| `fireworks` | Fireworks AI |
+| `ai360` | 360 Brain |
+| `hunyuan` | Tencent Hunyuan |
+| `stepfun` | Stepfun |
+| `cloudflare` | Cloudflare Workers AI |
+| `spark` | Xunfei Spark |
+| `gemini` | Google Gemini |
+| `vertex` | Google Vertex AI |
+| `bedrock` | AWS Bedrock |
+| `doubao` | ByteDance Doubao |
+| `coze` | Coze |
+| `dify` | Dify |
+| `ollama` | Ollama (local) |
+| `deepl` | DeepL (translation) |
+| `together-ai` | Together AI |
+| `triton` | NVIDIA Triton Inference Server |
+| `longcat` | Longcat |
+| `generic` | Generic passthrough |
+
+## Provider-specific fields
+
+### OpenAI (`type: openai`)
+
+<ParamField path="provider.openaiCustomUrl" type="string">
+  Custom backend URL using the OpenAI protocol, e.g., `www.example.com/myai/v1/chat/completions`.
+</ParamField>
+
+<ParamField path="provider.responseJsonSchema" type="object">
+  Predefined JSON Schema that OpenAI responses must adhere to. Only supported by select models.
+</ParamField>
+
+### Azure OpenAI (`type: azure`)
+
+<ParamField path="provider.azureServiceUrl" type="string" required>
+  URL of the Azure OpenAI service. Must include the `api-version` query parameter. Accepts three formats:
+  - Full URL (e.g., `https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT/chat/completions?api-version=...`)
+  - Resource + deployment name (path updated based on actual request path)
+  - Resource name only (deployment name filled from model mapping)
+</ParamField>
+
+<Note>
+  Azure OpenAI only supports configuring a single API token.
+</Note>
+
+### Anthropic Claude (`type: claude`)
+
+<ParamField path="provider.claudeVersion" type="string">
+  Claude API version. Defaults to `2023-06-01`.
+</ParamField>
+
+<ParamField path="provider.claudeCodeMode" type="boolean">
+  Enable Claude Code mode for OAuth token authentication. When `true`, the plugin uses Bearer Token authentication (instead of `x-api-key`), sets Claude Code-specific headers, appends `?beta=true` to request URLs, and injects the Claude Code system prompt if none is provided.
+</ParamField>
+
+### Tongyi Qwen (`type: qwen`)
+
+<ParamField path="provider.qwenEnableSearch" type="boolean">
+  Enable Qwen's built-in internet search function.
+</ParamField>
+
+<ParamField path="provider.qwenFileIds" type="array of string">
+  File IDs uploaded via the Dashscope file interface to use as conversation context. Cannot be used with `provider.context`.
+</ParamField>
+
+<ParamField path="provider.qwenEnableCompatible" type="boolean">
+  Enable Qwen compatibility mode. When `true`, the compatible-mode interface is called and the request/response is not modified. Defaults to `false`.
+</ParamField>
+
+### Moonshot (`type: moonshot`)
+
+<ParamField path="provider.moonshotFileId" type="string">
+  File ID uploaded via the Moonshot file interface to use as conversation context. Cannot be used with `provider.context`.
+</ParamField>
+
+### MiniMax (`type: minimax`)
+
+<ParamField path="provider.minimaxGroupId" type="string">
+  Required when using models `abab6.5-chat`, `abab6.5s-chat`, `abab5.5s-chat`, or `abab5.5-chat`. These models use the ChatCompletion Pro API and require a group ID.
+</ParamField>
+
+### Tencent Hunyuan (`type: hunyuan`)
+
+<ParamField path="provider.hunyuanAuthId" type="string" required>
+  Hunyuan authentication ID for v3 authentication.
+</ParamField>
+
+<ParamField path="provider.hunyuanAuthKey" type="string" required>
+  Hunyuan authentication key for v3 authentication.
+</ParamField>
+
+### Cloudflare Workers AI (`type: cloudflare`)
+
+<ParamField path="provider.cloudflareAccountId" type="string" required>
+  Cloudflare Account ID. Obtain from the Cloudflare dashboard under Workers AI.
+</ParamField>
+
+### Google Gemini (`type: gemini`)
+
+<ParamField path="provider.geminiSafetySetting" type="map of string">
+  Content filtering and safety level settings. Keys are harm categories (e.g., `HARM_CATEGORY_HARASSMENT`); values are block thresholds (e.g., `BLOCK_NONE`).
+</ParamField>
+
+<ParamField path="provider.apiVersion" type="string">
+  Gemini API version. Choose `v1` or `v1beta`. Defaults to `v1beta`.
+</ParamField>
+
+<ParamField path="provider.geminiThinkingBudget" type="number">
+  Thinking budget for Gemini 2.5 series models. `0` disables thinking mode; `-1` enables dynamic adjustment.
+</ParamField>
+
+### Google Vertex AI (`type: vertex`)
+
+Vertex AI supports three modes: Standard (Service Account), Express (API Key), and OpenAI Compatible.
+
+**Standard mode:**
+
+<ParamField path="provider.vertexAuthKey" type="string" required>
+  Google Service Account JSON key for authentication (PEM-encoded PKCS#8 private key with `client_email`).
+</ParamField>
+
+<ParamField path="provider.vertexRegion" type="string" required>
+  Google Cloud region (e.g., `us-central1`, `europe-west4`).
+</ParamField>
+
+<ParamField path="provider.vertexProjectId" type="string" required>
+  Google Cloud Project ID.
+</ParamField>
+
+<ParamField path="provider.vertexAuthServiceName" type="string" required>
+  Service name for OAuth2 authentication (accesses `oauth2.googleapis.com`).
+</ParamField>
+
+<ParamField path="provider.vertexGeminiSafetySetting" type="map of string">
+  Gemini model content safety filtering settings.
+</ParamField>
+
+<ParamField path="provider.vertexTokenRefreshAhead" type="number">
+  Access token refresh-ahead time in seconds.
+</ParamField>
+
+<ParamField path="provider.vertexOpenAICompatible" type="boolean">
+  Enable OpenAI-compatible mode. Uses Vertex AI's Chat Completions API directly without protocol conversion. Defaults to `false`. Mutually exclusive with Express mode (`apiTokens`).
+</ParamField>
+
+**Express mode** — use `provider.apiTokens` with a Vertex AI API Key instead of a service account.
+
+### AWS Bedrock (`type: bedrock`)
+
+<ParamField path="provider.awsAccessKey" type="string">
+  AWS Access Key ID for Signature V4 authentication. Use this or `apiTokens`, not both.
+</ParamField>
+
+<ParamField path="provider.awsSecretKey" type="string">
+  AWS Secret Access Key for Signature V4 authentication.
+</ParamField>
+
+<ParamField path="provider.awsRegion" type="string" required>
+  AWS region (e.g., `us-east-1`).
+</ParamField>
+
+<ParamField path="provider.bedrockAdditionalFields" type="object">
+  Additional inference parameters supported by the model (e.g., `top_k`).
+</ParamField>
+
+### Ollama (`type: ollama`)
+
+<ParamField path="provider.ollamaServerHost" type="string" required>
+  Host address of the Ollama server.
+</ParamField>
+
+<ParamField path="provider.ollamaServerPort" type="number" required>
+  Port of the Ollama server. Defaults to `11434`.
+</ParamField>
+
+### DeepL (`type: deepl`)
+
+<ParamField path="provider.targetLang" type="string" required>
+  Target language for translation (e.g., `ZH`, `EN`, `DE`).
+</ParamField>
+
+### Generic passthrough (`type: generic`)
+
+<ParamField path="provider.genericHost" type="string">
+  Overrides the upstream `Host` header. Routes traffic to a specific backend domain. When `apiTokens` are configured, `Authorization: Bearer <token>` is injected automatically.
+</ParamField>
+
+## Configuration examples
+
+<Tabs>
+  <Tab title="OpenAI">
+    ```yaml
+    provider:
+      type: openai
+      apiTokens:
+        - "YOUR_OPENAI_API_TOKEN"
+      modelMapping:
+        "*": "gpt-4o"
+    ```
+  </Tab>
+  <Tab title="Azure OpenAI">
+    ```yaml
+    provider:
+      type: azure
+      apiTokens:
+        - "YOUR_AZURE_OPENAI_API_TOKEN"
+      azureServiceUrl: "https://YOUR_RESOURCE_NAME.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT_NAME/chat/completions?api-version=2024-02-15-preview"
+    ```
+  </Tab>
+  <Tab title="Anthropic Claude">
+    ```yaml
+    provider:
+      type: claude
+      apiTokens:
+        - "YOUR_CLAUDE_API_TOKEN"
+      claudeVersion: "2023-06-01"
+    ```
+  </Tab>
+  <Tab title="Tongyi Qwen">
+    ```yaml
+    provider:
+      type: qwen
+      apiTokens:
+        - "YOUR_QWEN_API_TOKEN"
+      modelMapping:
+        "gpt-3": "qwen-turbo"
+        "gpt-35-turbo": "qwen-plus"
+        "gpt-4-turbo": "qwen-max"
+        "gpt-4-*": "qwen-max"
+        "gpt-4o": "qwen-vl-plus"
+        "*": "qwen-turbo"
+    ```
+  </Tab>
+  <Tab title="Google Gemini">
+    ```yaml
+    provider:
+      type: gemini
+      apiTokens:
+        - "YOUR_GEMINI_API_TOKEN"
+      modelMapping:
+        "*": "gemini-pro"
+      geminiSafetySetting:
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE"
+        "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE"
+        "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE"
+        "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE"
+    ```
+  </Tab>
+  <Tab title="AWS Bedrock">
+    ```yaml
+    provider:
+      type: bedrock
+      awsAccessKey: "YOUR_AWS_ACCESS_KEY_ID"
+      awsSecretKey: "YOUR_AWS_SECRET_ACCESS_KEY"
+      awsRegion: "us-east-1"
+    ```
+  </Tab>
+  <Tab title="Ollama">
+    ```yaml
+    provider:
+      type: ollama
+      ollamaServerHost: "localhost"
+      ollamaServerPort: 11434
+      modelMapping:
+        "*": "llama3"
+    ```
+  </Tab>
+</Tabs>
+
+### Model mapping examples
+
+```yaml
+provider:
+  type: qwen
+  apiTokens:
+    - "YOUR_QWEN_API_TOKEN"
+  modelMapping:
+    # Exact match
+    "gpt-3": "qwen-turbo"
+    # Prefix match (covers gpt-4-turbo, gpt-4-vision, etc.)
+    "gpt-4-*": "qwen-max"
+    # Fallback for all unmatched models
+    "*": "qwen-turbo"
+```
+
+### Custom settings example
+
+```yaml
+provider:
+  type: openai
+  apiTokens:
+    - "YOUR_API_TOKEN"
+  customSettings:
+    # Override max_tokens for all requests
+    - name: max_tokens
+      value: 2048
+      overwrite: true
+    # Set temperature only if not already set by the client
+    - name: temperature
+      value: 0.7
+      overwrite: false
+```
+
+### Context file example
+
+```yaml
+provider:
+  type: qwen
+  apiTokens:
+    - "YOUR_QWEN_API_TOKEN"
+  modelMapping:
+    "*": "qwen-turbo"
+  context:
+    fileUrl: "http://file.default.svc.cluster.local/ai/context.txt"
+    serviceName: "file.dns"
+    servicePort: 80
+```
+
+### Context cleanup commands
+
+```yaml
+provider:
+  type: qwen
+  apiTokens:
+    - "YOUR_QWEN_API_TOKEN"
+  modelMapping:
+    "*": "qwen-turbo"
+  contextCleanupCommands:
+    - "clear context"
+    - "/clear"
+    - "start over"
+    - "new conversation"
+```
+
+When a user message exactly matches a configured command, that message and all preceding non-system messages are removed. System messages and all messages after the command are preserved.
+
+### Claude Code mode
+
+```yaml
+provider:
+  type: claude
+  apiTokens:
+    - "sk-ant-oat01-xxxxx"  # Claude Code OAuth Token
+  claudeCodeMode: true
+```
+
+### Auto protocol compatibility (OpenAI and Claude in one endpoint)
+
+With auto protocol detection enabled by default, a single Claude provider configuration handles both `/v1/chat/completions` (OpenAI) and `/v1/messages` (Claude) requests:
+
+```yaml
+provider:
+  type: claude
+  apiTokens:
+    - "YOUR_CLAUDE_API_TOKEN"
+```
+
+For a provider that does not natively support the Claude protocol, the plugin converts automatically:
+
+```yaml
+provider:
+  type: qwen
+  apiTokens:
+    - "YOUR_QWEN_API_TOKEN"
+  modelMapping:
+    "claude-3-opus-20240229": "qwen-max"
+    "*": "qwen-turbo"
+```
+
+Requests to `/v1/messages` are automatically converted to the OpenAI protocol before being forwarded to Qwen.
+
+### Kubernetes deployment example
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-proxy-groq
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      provider:
+        type: groq
+        apiTokens:
+          - "YOUR_API_TOKEN"
+    ingress:
+    - groq
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:1.0.0
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    higress.io/backend-protocol: HTTPS
+    higress.io/destination: groq.dns
+    higress.io/proxy-ssl-name: api.groq.com
+    higress.io/proxy-ssl-server-name: "on"
+  name: groq
+  namespace: higress-system
+spec:
+  ingressClassName: higress
+  rules:
+  - host: <YOUR-DOMAIN>
+    http:
+      paths:
+      - backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+        path: /
+        pathType: Prefix
+---
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: default
+  namespace: higress-system
+spec:
+  registries:
+  - domain: api.groq.com
+    name: groq
+    port: 443
+    type: dns
+```

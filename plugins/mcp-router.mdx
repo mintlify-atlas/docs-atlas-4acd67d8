@@ -1,0 +1,116 @@
+---
+title: "MCP Router"
+description: "Route MCP (Model Context Protocol) tools/call requests to different backend MCP servers based on a server-name prefix in the tool name."
+---
+
+The `mcp-router` plugin provides routing for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) `tools/call` requests. It inspects the tool name in the JSON-RPC payload, and if the name contains a server identifier prefix (e.g., `server-name/tool-name`), it dynamically reroutes the request to the appropriate backend MCP server.
+
+This enables a single unified MCP endpoint that aggregates tools from multiple backend MCP servers. Clients send all `tools/call` requests to one endpoint; the `mcp-router` ensures each request reaches the server where the tool is actually hosted.
+
+## Execution properties
+
+This plugin has no fixed execution phase — it is applied to routes where it is configured.
+
+## Configuration
+
+<ParamField path="servers" type="array of object" required>
+  List of routing configurations for backend MCP servers. Each entry defines how to identify and reach one backend server.
+</ParamField>
+
+<ParamField path="servers[].name" type="string" required>
+  Unique identifier for the MCP server. Must match the prefix used in `tools/call` requests (the part before `/` in the tool name).
+</ParamField>
+
+<ParamField path="servers[].domain" type="string">
+  Domain (authority) of the backend MCP server. If omitted, the original request's domain is preserved.
+</ParamField>
+
+<ParamField path="servers[].path" type="string" required>
+  Path on the backend MCP server to which the request is routed.
+</ParamField>
+
+## How it works
+
+When a `tools/call` request arrives on a route with `mcp-router` enabled:
+
+1. **Tool name parsing** — the plugin reads the `name` field inside `params` of the JSON-RPC body.
+2. **Prefix matching** — if the name follows `server-name/tool-name`, the plugin splits it. If there is no `/`, the request is forwarded without modification.
+3. **Route lookup** — the extracted `server-name` is matched against the configured `servers` list.
+4. **Header modification** — the `:authority` and `:path` request headers are replaced with the matched server's `domain` and `path`.
+5. **Body modification** — the `name` field in the JSON-RPC body is updated to `tool-name` only (the `server-name/` prefix is removed).
+6. **Rerouting** — the gateway re-processes the request with the updated headers and forwards it to the correct backend.
+
+## Configuration example
+
+```yaml
+servers:
+  - name: random-user-server
+    domain: mcp.example.com
+    path: /mcp-servers/mcp-random-user-server
+  - name: rest-amap-server
+    domain: mcp.example.com
+    path: /mcp-servers/mcp-rest-amap-server
+```
+
+## Request routing example
+
+**Original client request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "rest-amap-server/get-weather",
+    "arguments": {
+      "location": "New York"
+    }
+  }
+}
+```
+
+**Plugin actions:**
+
+1. Tool name `rest-amap-server/get-weather` is split into server `rest-amap-server` and tool `get-weather`.
+2. Matched configuration: `domain: mcp.example.com`, `path: /mcp-servers/mcp-rest-amap-server`.
+3. Request headers updated:
+   - `:authority` → `mcp.example.com`
+   - `:path` → `/mcp-servers/mcp-rest-amap-server`
+4. Request body `name` updated to `get-weather`.
+
+**Modified request forwarded to backend:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "get-weather",
+    "arguments": {
+      "location": "New York"
+    }
+  }
+}
+```
+
+## Unmatched requests
+
+If the tool name does not contain a `/`, the plugin takes no action and the request is forwarded to the default route destination unchanged:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "get-weather",
+    "arguments": {
+      "location": "Paris"
+    }
+  }
+}
+```
+
+This passthrough behavior allows the `mcp-router` to coexist with direct tool calls on the same endpoint.

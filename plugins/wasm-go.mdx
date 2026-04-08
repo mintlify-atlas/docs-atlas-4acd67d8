@@ -1,0 +1,413 @@
+---
+title: "Writing Wasm plugins in Go"
+description: "Build, test, and deploy Higress Wasm plugins using the Go SDK."
+---
+
+The Go SDK (`github.com/higress-group/wasm-go`) is the primary way to write Higress plugins. It wraps the proxy-wasm ABI and provides a higher-level API for configuration, request/response manipulation, and HTTP callouts.
+
+## Prerequisites
+
+- Go 1.24 or later
+- Docker (for the builder image build path)
+- A Higress cluster or local Envoy instance for deployment
+
+## Project structure
+
+Each plugin lives in its own directory under `plugins/wasm-go/extensions/`. The minimum required files are:
+
+```
+extensions/my-plugin/
+├── go.mod
+└── main.go
+```
+
+A `VERSION` file and `README.md` are required if you intend to contribute the plugin to the official registry.
+
+## Writing a plugin
+
+### Minimal example: hello-world
+
+The following is the complete source of the `hello-world` plugin from `plugins/wasm-go/extensions/hello-world/main.go`:
+
+```go
+package main
+
+import (
+	"net/http"
+
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
+	"github.com/higress-group/wasm-go/pkg/log"
+	"github.com/higress-group/wasm-go/pkg/wrapper"
+)
+
+func main() {}
+
+func init() {
+	wrapper.SetCtx(
+		"hello-world",
+		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
+	)
+}
+
+type HelloWorldConfig struct{}
+
+func onHttpRequestHeaders(ctx wrapper.HttpContext, config HelloWorldConfig, log log.Log) types.Action {
+	err := proxywasm.AddHttpRequestHeader("hello", "world")
+	if err != nil {
+		log.Critical("failed to set request header")
+	}
+	proxywasm.SendHttpResponseWithDetail(http.StatusOK, "hello-world", nil, []byte("hello world"), -1)
+	return types.ActionContinue
+}
+```
+
+The entry point is `wrapper.SetCtx`. The first argument is the plugin name; the remaining arguments are functional options that register handlers.
+
+### Plugin with configuration
+
+Plugins read their configuration from the `WasmPlugin` resource at load time. The `ParseConfigBy` option registers a parser that receives the raw JSON and populates a typed config struct.
+
+The following is from `plugins/wasm-go/extensions/request-block/main.go`:
+
+```go
+package main
+
+import (
+	"errors"
+	"regexp"
+	"strings"
+
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
+	"github.com/higress-group/wasm-go/pkg/log"
+	"github.com/higress-group/wasm-go/pkg/wrapper"
+	"github.com/tidwall/gjson"
+)
+
+func main() {}
+
+func init() {
+	wrapper.SetCtx(
+		"request-block",
+		wrapper.ParseConfigBy(parseConfig),
+		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
+		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
+	)
+}
+
+type RequestBlockConfig struct {
+	blockedCode      uint32
+	blockedMessage   string
+	caseSensitive    bool
+	blockUrls        []string
+	blockExactUrls   []string
+	blockHeaders     []string
+	blockBodies      []string
+	blockRegExpArray []*regexp.Regexp
+}
+
+func parseConfig(json gjson.Result, config *RequestBlockConfig, log log.Log) error {
+	code := json.Get("blocked_code").Int()
+	if code != 0 && code > 100 && code < 600 {
+		config.blockedCode = uint32(code)
+	} else {
+		config.blockedCode = 403
+	}
+	config.blockedMessage = json.Get("blocked_message").String()
+	config.caseSensitive = json.Get("case_sensitive").Bool()
+	for _, item := range json.Get("block_urls").Array() {
+		url := item.String()
+		if url == "" {
+			continue
+		}
+		if config.caseSensitive {
+			config.blockUrls = append(config.blockUrls, url)
+		} else {
+			config.blockUrls = append(config.blockUrls, strings.ToLower(url))
+		}
+	}
+	if len(config.blockUrls) == 0 && len(config.blockHeaders) == 0 &&
+		len(config.blockBodies) == 0 {
+		return errors.New("there is no block rules")
+	}
+	return nil
+}
+
+func onHttpRequestHeaders(ctx wrapper.HttpContext, config RequestBlockConfig, log log.Log) types.Action {
+	if len(config.blockUrls) > 0 {
+		requestUrl, err := proxywasm.GetHttpRequestHeader(":path")
+		if err != nil {
+			log.Warnf("get path failed: %v", err)
+			return types.ActionContinue
+		}
+		if !config.caseSensitive {
+			requestUrl = strings.ToLower(requestUrl)
+		}
+		for _, blockUrl := range config.blockUrls {
+			if strings.Contains(requestUrl, blockUrl) {
+				proxywasm.SendHttpResponseWithDetail(
+					config.blockedCode,
+					"request-block.url_blocked",
+					nil,
+					[]byte(config.blockedMessage),
+					-1,
+				)
+				return types.ActionContinue
+			}
+		}
+	}
+	if len(config.blockBodies) == 0 {
+		ctx.DontReadRequestBody()
+	}
+	return types.ActionContinue
+}
+
+func onHttpRequestBody(ctx wrapper.HttpContext, config RequestBlockConfig, body []byte, log log.Log) types.Action {
+	bodyStr := string(body)
+	if !config.caseSensitive {
+		bodyStr = strings.ToLower(bodyStr)
+	}
+	for _, blockBody := range config.blockBodies {
+		if strings.Contains(bodyStr, blockBody) {
+			proxywasm.SendHttpResponseWithDetail(
+				config.blockedCode,
+				"request-block.body_blocked",
+				nil,
+				[]byte(config.blockedMessage),
+				-1,
+			)
+			return types.ActionContinue
+		}
+	}
+	return types.ActionContinue
+}
+```
+
+## Handler reference
+
+Register handlers using these functional options in `wrapper.SetCtx`:
+
+| Option | Handler signature | When called |
+|---|---|---|
+| `ProcessRequestHeadersBy(fn)` | `func(ctx HttpContext, cfg T, log Log) types.Action` | Request headers received |
+| `ProcessRequestBodyBy(fn)` | `func(ctx HttpContext, cfg T, body []byte, log Log) types.Action` | Request body received |
+| `ProcessResponseHeadersBy(fn)` | `func(ctx HttpContext, cfg T, log Log) types.Action` | Response headers received |
+| `ProcessResponseBodyBy(fn)` | `func(ctx HttpContext, cfg T, body []byte, log Log) types.Action` | Response body received |
+| `ProcessStreamingResponseBody(fn)` | `func(ctx HttpContext, cfg T, chunk []byte, isLastChunk bool) []byte` | Each response body chunk (SSE / streaming) |
+| `ParseConfigBy(fn)` | `func(json gjson.Result, cfg *T, log Log) error` | Plugin load / config change |
+
+<Note>
+If your request headers handler does not need to read the request body, call `ctx.DontReadRequestBody()` to skip buffering. Similarly, call `ctx.DontReadResponseBody()` to skip response buffering. Omitting these calls on unused phases buffers the body unnecessarily.
+</Note>
+
+## Accessing request and response data
+
+Use the `proxywasm` package functions to read and modify headers and bodies:
+
+```go
+// Read a request header
+value, err := proxywasm.GetHttpRequestHeader(":path")
+
+// Add a request header
+err = proxywasm.AddHttpRequestHeader("x-custom", "value")
+
+// Replace a request header
+err = proxywasm.ReplaceHttpRequestHeader(":path", "/new-path")
+
+// Remove a request header
+err = proxywasm.RemoveHttpRequestHeader("x-remove-me")
+
+// Get all request headers
+headers, err := proxywasm.GetHttpRequestHeaders()
+
+// Read a response header
+status, err := proxywasm.GetHttpResponseHeader(":status")
+
+// Send an early response (short-circuit the request)
+proxywasm.SendHttpResponseWithDetail(403, "plugin.blocked", nil, []byte("Forbidden"), -1)
+```
+
+## go.mod setup
+
+Each plugin uses its own `go.mod`. The required dependencies are:
+
+```go
+module github.com/alibaba/higress/plugins/wasm-go/extensions/my-plugin
+
+go 1.24.1
+
+require (
+	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250822030947-8345453fddd0
+	github.com/higress-group/wasm-go v1.0.2-0.20250821081215-b573359becf8
+)
+```
+
+## Building the plugin
+
+### Docker builder (recommended)
+
+From the `plugins/wasm-go/` directory, run:
+
+```bash
+PLUGIN_NAME=my-plugin make build
+```
+
+This uses the pre-built Docker builder image and produces:
+- `extensions/my-plugin/plugin.wasm` — the compiled Wasm binary
+- A tagged OCI image
+
+**Build variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `PLUGIN_NAME` | `hello-world` | Name of the plugin directory to build |
+| `REGISTRY` | `higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/` | Image registry prefix |
+| `PLUGIN_VERSION` | Git commit + timestamp | Version tag for the output image |
+
+To build and push to your own registry:
+
+```bash
+PLUGIN_NAME=my-plugin REGISTRY=example.registry.io/my-org/ make build-push
+```
+
+### Local build (without Docker)
+
+```bash
+cd extensions/my-plugin
+GOOS=wasip1 GOARCH=wasm go build -o ./main.wasm .
+```
+
+Then package the `.wasm` file into an OCI image:
+
+```dockerfile
+FROM scratch
+COPY main.wasm plugin.wasm
+```
+
+```bash
+docker build -t example.registry.io/my-org/my-plugin:1.0.0 -f Dockerfile .
+docker push example.registry.io/my-org/my-plugin:1.0.0
+```
+
+## Testing the plugin
+
+The `github.com/higress-group/wasm-go/pkg/test` package provides a test host that runs your plugin in-process without a real Envoy instance.
+
+The following is from `plugins/wasm-go/extensions/hello-world/main_test.go`:
+
+```go
+package main
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
+	"github.com/higress-group/wasm-go/pkg/test"
+	"github.com/stretchr/testify/require"
+)
+
+func TestOnHttpRequestHeaders(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(nil)
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+
+		action := host.CallOnHttpRequestHeaders([][2]string{
+			{":authority", "example.com"},
+			{":path", "/test"},
+			{":method", "GET"},
+		})
+		require.Equal(t, types.ActionContinue, action)
+
+		localResponse := host.GetLocalResponse()
+		require.Equal(t, uint32(http.StatusOK), localResponse.StatusCode)
+		require.Equal(t, "hello world", string(localResponse.Data))
+	})
+}
+```
+
+For plugins that need configuration, pass a `json.RawMessage` to `test.NewTestHost`:
+
+```go
+config := json.RawMessage(`{"block_urls": ["swagger.html"], "blocked_code": 403}`)
+host, status := test.NewTestHost(config)
+```
+
+Available test host methods:
+
+| Method | Description |
+|---|---|
+| `CallOnHttpRequestHeaders(headers)` | Invoke the request headers handler |
+| `CallOnHttpRequestBody(body)` | Invoke the request body handler |
+| `CallOnHttpResponseHeaders(headers)` | Invoke the response headers handler |
+| `CallOnHttpResponseBody(body)` | Invoke the response body handler |
+| `GetLocalResponse()` | Get the response sent by `SendHttpResponseWithDetail` |
+| `GetMatchConfig()` | Get the parsed configuration struct |
+| `CompleteHttp()` | Signal end of request lifecycle |
+
+Run tests with the standard Go test command:
+
+```bash
+cd extensions/my-plugin
+go test ./...
+```
+
+## Deploying the plugin
+
+Apply a `WasmPlugin` resource pointing to your image:
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: my-plugin
+  namespace: higress-system
+spec:
+  selector:
+    matchLabels:
+      higress: higress-system-higress-gateway
+  defaultConfig:
+    block_urls:
+    - "swagger.html"
+  url: oci://example.registry.io/my-org/my-plugin:1.0.0
+```
+
+```bash
+kubectl apply -f my-plugin.yaml
+```
+
+For route-level or domain-level configuration, add `matchRules`:
+
+```yaml
+spec:
+  defaultConfig:
+    block_urls:
+    - "swagger.html"
+  matchRules:
+  - ingress:
+    - default/my-ingress
+    config:
+      block_urls:
+      - "admin"
+  url: oci://example.registry.io/my-org/my-plugin:1.0.0
+```
+
+<Tip>
+During development, you can load a local `.wasm` file directly using a `file://` URL. The path must be accessible inside the gateway pod.
+
+```yaml
+url: file:///opt/plugins/wasm-go/extensions/my-plugin/plugin.wasm
+```
+</Tip>
+
+## E2E testing
+
+To run an end-to-end test using a local Wasm file:
+
+```bash
+PLUGIN_NAME=my-plugin make higress-wasmplugin-test
+```
+
+This builds the plugin, loads it into a local Higress instance via a `file://` URL, and runs the test cases defined in `test/e2e/conformance/tests/`.

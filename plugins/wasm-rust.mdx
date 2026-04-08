@@ -1,0 +1,492 @@
+---
+title: "Writing Wasm plugins in Rust"
+description: "Build, test, and deploy Higress Wasm plugins using the Rust SDK."
+---
+
+The Rust SDK (`higress-wasm-rust`) is built on top of [proxy-wasm-rust-sdk](https://github.com/higress-group/proxy-wasm-rust-sdk) and provides rule matching, Redis integration, HTTP callouts, and structured logging.
+
+## Prerequisites
+
+- Rust 1.80 or later (managed via `rustup`)
+- WASI target: `rustup target add wasm32-wasip1`
+- Docker (for the builder image build path)
+
+<Warning>
+Use `rustup` to manage Rust. If Homebrew's Rust is installed alongside `rustup`, the `wasm32-wasip1` target may not resolve correctly. Run `brew uninstall rust` and ensure `source "$HOME/.cargo/env"` is in your shell profile.
+</Warning>
+
+## Project structure
+
+```
+plugins/wasm-rust/
+├── src/                     # SDK core (do not modify)
+│   ├── cluster_wrapper.rs
+│   ├── error.rs
+│   ├── event_stream.rs
+│   ├── internal.rs
+│   ├── log.rs
+│   ├── plugin_wrapper.rs
+│   ├── redis_wrapper.rs
+│   ├── request_wrapper.rs
+│   └── rule_matcher.rs
+├── extensions/              # Your plugins go here
+│   ├── say-hello/
+│   ├── request-block/
+│   ├── ai-data-masking/
+│   └── ai-intent/
+├── Cargo.toml               # Workspace manifest
+└── Makefile
+```
+
+Each plugin is an independent library crate under `extensions/`.
+
+## Creating a plugin
+
+<Steps>
+  <Step title="Create the plugin directory">
+    ```bash
+    mkdir plugins/wasm-rust/extensions/my-plugin
+    cd plugins/wasm-rust/extensions/my-plugin
+    ```
+  </Step>
+  <Step title="Create Cargo.toml">
+    ```toml
+    [package]
+    name = "my-plugin"
+    version = "0.1.0"
+    edition = "2021"
+    publish = false
+
+    [lib]
+    crate-type = ["cdylib"]
+
+    [dependencies]
+    higress-wasm-rust = { path = "../../", version = "0.1.0" }
+    proxy-wasm = { git = "https://github.com/higress-group/proxy-wasm-rust-sdk", branch = "main", version = "0.2.2" }
+    serde = { version = "1.0", features = ["derive"] }
+    serde_json = "1.0"
+    ```
+  </Step>
+  <Step title="Write the plugin code">
+    Create `src/lib.rs` with your plugin implementation (see examples below).
+  </Step>
+</Steps>
+
+## Writing a plugin
+
+### Minimal example: say-hello
+
+The following is the complete source of `plugins/wasm-rust/extensions/say-hello/src/lib.rs`:
+
+```rust
+use higress_wasm_rust::log::Log;
+use higress_wasm_rust::rule_matcher::{on_configure, RuleMatcher, SharedRuleMatcher};
+use proxy_wasm::traits::{Context, HttpContext, RootContext};
+use proxy_wasm::types::{ContextType, HeaderAction, LogLevel};
+use serde::Deserialize;
+use std::cell::RefCell;
+use std::ops::DerefMut;
+use std::rc::Rc;
+
+proxy_wasm::main! {{
+    proxy_wasm::set_log_level(LogLevel::Trace);
+    proxy_wasm::set_root_context(|_| Box::new(SayHelloRoot::new()));
+}}
+
+struct SayHelloRoot {
+    log: Log,
+    rule_matcher: SharedRuleMatcher<SayHelloConfig>,
+}
+
+struct SayHello {
+    rule_matcher: SharedRuleMatcher<SayHelloConfig>,
+}
+
+#[derive(Default, Debug, Deserialize)]
+struct SayHelloConfig {
+    name: String,
+}
+
+impl SayHelloRoot {
+    fn new() -> Self {
+        SayHelloRoot {
+            log: Log::new("say_hello".to_string()),
+            rule_matcher: Rc::new(RefCell::new(RuleMatcher::default())),
+        }
+    }
+}
+
+impl Context for SayHelloRoot {}
+
+impl RootContext for SayHelloRoot {
+    fn on_configure(&mut self, _plugin_configuration_size: usize) -> bool {
+        on_configure(
+            self,
+            _plugin_configuration_size,
+            self.rule_matcher.borrow_mut().deref_mut(),
+            &self.log,
+        )
+    }
+
+    fn create_http_context(&self, _context_id: u32) -> Option<Box<dyn HttpContext>> {
+        Some(Box::new(SayHello {
+            rule_matcher: self.rule_matcher.clone(),
+        }))
+    }
+
+    fn get_type(&self) -> Option<ContextType> {
+        Some(ContextType::HttpContext)
+    }
+}
+
+impl Context for SayHello {}
+
+impl HttpContext for SayHello {
+    fn on_http_request_headers(
+        &mut self,
+        _num_headers: usize,
+        _end_of_stream: bool,
+    ) -> HeaderAction {
+        let binding = self.rule_matcher.borrow();
+        let config = match binding.get_match_config() {
+            None => {
+                self.send_http_response(200, vec![], Some("Hello, World!".as_bytes()));
+                return HeaderAction::Continue;
+            }
+            Some(config) => config.1,
+        };
+
+        self.send_http_response(
+            200,
+            vec![],
+            Some(format!("Hello, {}!", config.name).as_bytes()),
+        );
+        HeaderAction::Continue
+    }
+}
+```
+
+The `proxy_wasm::main!` macro registers the root context factory. `SayHelloRoot` manages shared configuration via `SharedRuleMatcher<T>`. Each request creates a fresh `SayHello` context that borrows the parsed config.
+
+### Plugin with the HttpContextWrapper
+
+For more complex plugins, use `HttpContextWrapper` and `RootContextWrapper`. These traits provide convenience methods like `on_http_request_complete_headers` (called once all headers are available) and automatic body buffering.
+
+The following is a condensed version of `plugins/wasm-rust/extensions/request-block/src/lib.rs`:
+
+```rust
+use higress_wasm_rust::log::Log;
+use higress_wasm_rust::plugin_wrapper::{HttpContextWrapper, RootContextWrapper};
+use higress_wasm_rust::rule_matcher::{on_configure, RuleMatcher, SharedRuleMatcher};
+use multimap::MultiMap;
+use proxy_wasm::traits::{Context, HttpContext, RootContext};
+use proxy_wasm::types::{Bytes, ContextType, DataAction, HeaderAction, LogLevel};
+use serde::Deserialize;
+use std::cell::RefCell;
+use std::ops::DerefMut;
+use std::rc::Rc;
+
+proxy_wasm::main! {{
+    proxy_wasm::set_log_level(LogLevel::Trace);
+    proxy_wasm::set_root_context(|_| Box::new(RequestBlockRoot::new()));
+}}
+
+#[derive(Default, Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RequestBlockConfig {
+    #[serde(default = "default_blocked_code")]
+    blocked_code: u32,
+    blocked_message: String,
+    #[serde(default = "default_case_sensitive")]
+    case_sensitive: bool,
+    block_urls: Vec<String>,
+    block_headers: Vec<String>,
+    block_bodies: Vec<String>,
+}
+
+fn default_blocked_code() -> u32 { 403 }
+fn default_case_sensitive() -> bool { true }
+
+struct RequestBlockRoot {
+    log: Log,
+    rule_matcher: SharedRuleMatcher<RequestBlockConfig>,
+}
+
+struct RequestBlock {
+    log: Log,
+    config: Option<Rc<RequestBlockConfig>>,
+    cache_request: bool,
+}
+
+impl RequestBlockRoot {
+    fn new() -> Self {
+        RequestBlockRoot {
+            log: Log::new("request-block".to_string()),
+            rule_matcher: Rc::new(RefCell::new(RuleMatcher::default())),
+        }
+    }
+}
+
+impl Context for RequestBlockRoot {}
+
+impl RootContext for RequestBlockRoot {
+    fn on_configure(&mut self, plugin_configuration_size: usize) -> bool {
+        on_configure(
+            self,
+            plugin_configuration_size,
+            self.rule_matcher.borrow_mut().deref_mut(),
+            &self.log,
+        )
+    }
+    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
+        self.create_http_context_use_wrapper(context_id)
+    }
+    fn get_type(&self) -> Option<ContextType> {
+        Some(ContextType::HttpContext)
+    }
+}
+
+impl RootContextWrapper<RequestBlockConfig> for RequestBlockRoot {
+    fn rule_matcher(&self) -> &SharedRuleMatcher<RequestBlockConfig> {
+        &self.rule_matcher
+    }
+
+    fn create_http_context_wrapper(
+        &self,
+        _context_id: u32,
+    ) -> Option<Box<dyn HttpContextWrapper<RequestBlockConfig>>> {
+        Some(Box::new(RequestBlock {
+            cache_request: false,
+            config: None,
+            log: Log::new("request-block".to_string()),
+        }))
+    }
+}
+
+impl Context for RequestBlock {}
+impl HttpContext for RequestBlock {}
+
+impl HttpContextWrapper<RequestBlockConfig> for RequestBlock {
+    fn on_config(&mut self, config: Rc<RequestBlockConfig>) {
+        self.cache_request = !config.block_bodies.is_empty();
+        self.config = Some(config);
+    }
+
+    fn cache_request_body(&self) -> bool {
+        self.cache_request
+    }
+
+    fn on_http_request_complete_headers(
+        &mut self,
+        headers: &MultiMap<String, String>,
+    ) -> HeaderAction {
+        let config = match &self.config {
+            None => return HeaderAction::Continue,
+            Some(c) => c,
+        };
+        if !config.block_urls.is_empty() {
+            let path = headers.get(":path").cloned().unwrap_or_default();
+            let path = if config.case_sensitive {
+                path
+            } else {
+                path.to_lowercase()
+            };
+            for block_url in &config.block_urls {
+                if path.contains(block_url) {
+                    self.send_http_response(
+                        config.blocked_code,
+                        vec![],
+                        Some(config.blocked_message.as_bytes()),
+                    );
+                    return HeaderAction::StopIteration;
+                }
+            }
+        }
+        HeaderAction::Continue
+    }
+
+    fn on_http_request_complete_body(&mut self, body: &Bytes) -> DataAction {
+        let config = match &self.config {
+            None => return DataAction::Continue,
+            Some(c) => c,
+        };
+        for block_body in &config.block_bodies {
+            let needle = block_body.as_bytes();
+            let haystack = if config.case_sensitive {
+                body.clone()
+            } else {
+                body.to_ascii_lowercase()
+            };
+            if haystack.windows(needle.len()).any(|w| w == needle) {
+                self.send_http_response(
+                    config.blocked_code,
+                    vec![],
+                    Some(config.blocked_message.as_bytes()),
+                );
+                return DataAction::StopIterationAndBuffer;
+            }
+        }
+        DataAction::Continue
+    }
+}
+```
+
+## SDK traits and types
+
+### Core traits
+
+| Trait | Purpose |
+|---|---|
+| `RootContext` | Plugin lifecycle: `on_configure`, `create_http_context` |
+| `HttpContext` | Per-request lifecycle: `on_http_request_headers`, `on_http_response_headers`, etc. |
+| `RootContextWrapper<C>` | Higher-level wrapper; handles rule matching and context creation |
+| `HttpContextWrapper<C>` | Higher-level wrapper; provides `on_config`, `on_http_request_complete_headers`, `on_http_request_complete_body` |
+| `Context` | Base trait required by all context types |
+
+### Return types
+
+| Phase | Return type | Values |
+|---|---|---|
+| Request / response headers | `HeaderAction` | `Continue`, `StopIteration` |
+| Request / response body | `DataAction` | `Continue`, `StopIterationAndBuffer`, `StopIterationAndWatermark` |
+
+### Logging
+
+```rust
+use higress_wasm_rust::log::Log;
+
+let log = Log::new("my-plugin".to_string());
+
+log.info("Processing request");
+log.debugf(format_args!("Path: {}", path));
+log.warn("Unexpected header value");
+log.error("Failed to parse config");
+```
+
+### Rule matcher
+
+`SharedRuleMatcher<C>` is a reference-counted, interior-mutable handle to the rule matching state. It deserializes plugin configuration from JSON using `serde` and returns the matching config for each request via `get_match_config()`.
+
+```rust
+let binding = self.rule_matcher.borrow();
+let config = match binding.get_match_config() {
+    None => {
+        // no matching rule — apply default behavior
+        return HeaderAction::Continue;
+    }
+    Some((_match_type, cfg)) => cfg,
+};
+```
+
+## Building the plugin
+
+### Using Make (recommended)
+
+From the `plugins/wasm-rust/` directory:
+
+```bash
+make build PLUGIN_NAME=my-plugin
+```
+
+The output is `extensions/my-plugin/plugin.wasm`.
+
+To build a Docker image:
+
+```bash
+make build-image PLUGIN_NAME=my-plugin PLUGIN_VERSION=1.0.0
+```
+
+**Build variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `PLUGIN_NAME` | `say-hello` | Plugin directory to build |
+| `PLUGIN_VERSION` | (unset) | Version tag for the output image |
+
+### Using Cargo directly
+
+From the plugin directory:
+
+```bash
+cd extensions/my-plugin
+cargo build --target wasm32-wasip1 --release
+```
+
+The compiled binary is at `target/wasm32-wasip1/release/my_plugin.wasm`.
+
+### Docker build
+
+From the `plugins/wasm-rust/` directory:
+
+```bash
+docker build -t my-plugin:1.0.0 --build-arg PLUGIN_NAME=my-plugin .
+```
+
+The Dockerfile uses a multi-stage build: a `rust:1.80` builder stage compiles the Wasm binary, and the final image is based on `scratch` — resulting in a minimal image of approximately 300–400 KB containing only the compiled `.wasm` file.
+
+## Running tests
+
+```bash
+# Run all tests
+make test-base
+
+# Run tests for a specific plugin
+make test PLUGIN_NAME=my-plugin
+
+# Run unit tests directly with Cargo (from the plugin directory)
+cd extensions/my-plugin
+cargo test
+```
+
+## Deploying the plugin
+
+Package the `.wasm` file into an OCI image and reference it in a `WasmPlugin` resource:
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: my-plugin
+  namespace: higress-system
+spec:
+  selector:
+    matchLabels:
+      higress: higress-system-higress-gateway
+  defaultConfig:
+    name: "world"
+  url: oci://example.registry.io/my-org/my-plugin:1.0.0
+```
+
+```bash
+kubectl apply -f my-plugin.yaml
+```
+
+For route-level or domain-level configuration, add `matchRules`:
+
+```yaml
+spec:
+  defaultConfig:
+    name: "world"
+  matchRules:
+  - ingress:
+    - default/my-ingress
+    config:
+      name: "Alice"
+  url: oci://example.registry.io/my-org/my-plugin:1.0.0
+```
+
+## Available extensions
+
+The following Rust plugins are included in the repository under `plugins/wasm-rust/extensions/`:
+
+| Plugin | Description |
+|---|---|
+| `say-hello` | Minimal example demonstrating the full plugin structure |
+| `request-block` | Block requests by URL pattern, header, or body content |
+| `ai-data-masking` | Mask sensitive data in AI request and response bodies |
+| `ai-intent` | Classify user intent using an LLM and attach the label to the request |
+| `demo-wasm` | Full-featured demo including Redis integration |
+
+<Note>
+Some plugins such as `ai-data-masking` depend on C libraries and may require additional configuration to build locally. Start with `say-hello` or `request-block` to validate your build environment.
+</Note>

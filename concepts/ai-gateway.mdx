@@ -1,0 +1,290 @@
+---
+title: "AI Gateway"
+description: "How Higress acts as an AI-native API gateway — unified LLM access, multi-model load balancing, token rate limiting, semantic caching, observability, and MCP Server hosting."
+---
+
+Higress was purpose-built to handle AI workloads. Its AI gateway capabilities unify access to dozens of LLM providers behind a single OpenAI-compatible API, add observability and rate limiting at the token level, cache responses semantically, and host Model Context Protocol (MCP) servers for AI agents — all without any traffic disruption.
+
+---
+
+## Unified LLM API
+
+All LLM providers are accessed through a single entry point using standard protocol paths:
+
+| Path | Protocol | Use case |
+|---|---|---|
+| `/v1/chat/completions` | OpenAI Messages API | Text generation, chat |
+| `/v1/messages` | Anthropic Claude Messages API | Claude-native client support |
+| `/v1/embeddings` | OpenAI Embeddings API | Text vector generation |
+| `/v1/images/generations` | OpenAI Image API | Text-to-image generation |
+
+**Automatic protocol detection** is built in: Higress inspects the request path and, if the target provider does not natively support the detected protocol, performs conversion automatically — no `protocol` field needs to be set.
+
+```
+Client (OpenAI SDK or Claude SDK)
+        │
+        ▼
+  Higress AI Gateway
+  ┌──────────────────────────────────────────────────────┐
+  │  Protocol detection  →  ai-proxy Wasm plugin         │
+  │  Auth / rate limit   →  ai-token-ratelimit plugin     │
+  │  Semantic cache      →  ai-cache plugin               │
+  │  Observability       →  ai-statistics plugin          │
+  └──────────────────────────────────────────────────────┘
+        │
+        ▼
+  Target LLM Provider API
+  (protocol translated if necessary)
+```
+
+---
+
+## Supported Providers
+
+The `ai-proxy` plugin supports the following providers. Each is configured by setting `provider.type` in the plugin config:
+
+<Tabs>
+  <Tab title="Global Providers">
+    | Provider | `type` value |
+    |---|---|
+    | OpenAI | `openai` |
+    | Azure OpenAI | `azure` |
+    | Anthropic Claude | `claude` |
+    | Google Gemini | `gemini` |
+    | Google Vertex AI | `vertex` |
+    | AWS Bedrock | `bedrock` |
+    | Groq | `groq` |
+    | Grok (xAI) | `grok` |
+    | Mistral | `mistral` |
+    | Cohere | `cohere` |
+    | OpenRouter | `openrouter` |
+    | Fireworks AI | `fireworks` |
+    | Together AI | `together_ai` |
+    | GitHub Models | `github` |
+    | Cloudflare Workers AI | `cloudflare` |
+    | Ollama (self-hosted) | `ollama` |
+    | vLLM (self-hosted) | `vllm` |
+    | NVIDIA Triton | `triton` |
+    | Generic (passthrough) | `generic` |
+    | DeepL (translation) | `deepl` |
+  </Tab>
+  <Tab title="China Providers">
+    | Provider | `type` value |
+    |---|---|
+    | Alibaba Qwen (Tongyi) | `qwen` |
+    | DeepSeek | `deepseek` |
+    | Moonshot | `moonshot` |
+    | Baidu ERNIE Bot | `baidu` |
+    | Tencent Hunyuan | `hunyuan` |
+    | iFlytek Spark | `spark` |
+    | Zhipu AI (GLM) | `zhipuai` |
+    | Yi (Zero One Universe) | `yi` |
+    | Baichuan AI | `baichuan` |
+    | MiniMax | `minimax` |
+    | 360 Brain | `ai360` |
+    | Stepfun | `stepfun` |
+    | Doubao (ByteDance) | `doubao` |
+    | Coze (ByteDance) | `coze` |
+    | Dify | `dify` |
+    | LongCat | `longcat` |
+  </Tab>
+</Tabs>
+
+### Model mapping
+
+Provider-specific model names can be remapped so that clients continue to use OpenAI model names while Higress forwards requests to the appropriate model on the target provider:
+
+```yaml
+provider:
+  type: qwen
+  apiTokens:
+    - "YOUR_QWEN_API_TOKEN"
+  modelMapping:
+    'gpt-4-turbo': "qwen-max"
+    'gpt-4-*':     "qwen-max"
+    'gpt-3.5-turbo': "qwen-plus"
+    '*':           "qwen-turbo"   # fallback
+```
+
+---
+
+## Multi-Model Load Balancing
+
+The `ai-load-balancer` plugin (requires Higress ≥ v2.1.5) provides LLM-aware load balancing policies that go beyond standard round-robin:
+
+<CardGroup cols={2}>
+  <Card title="Global Least Request" icon="scale-balanced">
+    Tracks in-flight request counts per backend in Redis. Each new request is routed to the backend with the fewest active requests globally, not just locally.
+  </Card>
+  <Card title="Prefix Cache Affinity" icon="bookmark">
+    Routes requests to the backend node whose KV cache is most likely to contain a matching prompt prefix, reducing time-to-first-token for repeated or similar prompts.
+  </Card>
+  <Card title="Endpoint Metrics" icon="chart-line">
+    Routes based on metrics exposed by the LLM service endpoints themselves (e.g., queue depth, GPU utilization).
+  </Card>
+  <Card title="Cluster Metrics" icon="server">
+    Routes between upstream clusters based on aggregate cluster-level metrics.
+  </Card>
+</CardGroup>
+
+If the plugin is disabled, load balancing falls back to the service's native strategy (round-robin, random, consistent hash, etc.).
+
+---
+
+## Token-Based Rate Limiting
+
+The `ai-token-ratelimit` plugin enforces limits on **LLM token consumption** rather than on raw request counts. Limits are tracked in Redis and can be applied at two granularities:
+
+- **Rule-level global limiting** — a shared token budget across all requests matching a rule.
+- **Key-level dynamic limiting** — per-consumer, per-IP, per-header, per-cookie, or per-query-parameter budgets.
+
+```yaml
+# Allow 100,000 tokens per hour per API key (from Authorization header)
+rule_name: "per-consumer-hourly"
+rule_items:
+- limit_by_per_header: "Authorization"
+  limit_keys:
+  - key: "*"
+    token_per_hour: 100000
+redis:
+  serviceName: my-redis.dns
+  servicePort: 6379
+```
+
+Rate limits can be expressed as `token_per_second`, `token_per_minute`, `token_per_hour`, or `token_per_day`. Requests that exceed the limit receive HTTP 429 with a configurable message.
+
+---
+
+## Semantic Caching
+
+The `ai-cache` plugin caches LLM responses and serves cache hits without forwarding the request to the upstream provider. Both **streaming** (SSE) and **non-streaming** responses are cached.
+
+```yaml
+redis:
+  serviceName: my-redis.dns
+  servicePort: 6379
+  timeout: 2000
+cacheTTL: 3600   # seconds; 0 = never expire
+```
+
+Cache keys are extracted from the request body using [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) expressions. The default key expression — `messages.@reverse.0.content` — uses the last message in the conversation as the cache key.
+
+<Tip>
+  To bypass the cache for a specific request without changing configuration, send the header `x-higress-skip-ai-cache: on`. The response to that request will also not be stored in the cache.
+</Tip>
+
+---
+
+## AI Observability
+
+The `ai-statistics` plugin instruments every LLM request with metrics, logs, and trace spans — no custom instrumentation needed in client code.
+
+**Default metrics** (dimensions: gateway, route, service, model):
+
+- Input token count
+- Output token count
+- Time to first token (TTFT) for streaming requests
+- Total request round-trip time
+
+**Default log fields:**
+
+| Field | Description |
+|---|---|
+| `input_token` | Number of tokens in the request |
+| `output_token` | Number of tokens in the response |
+| `model` | Model name as returned by the provider |
+| `llm_service_duration` | Time spent waiting for the LLM service |
+| `llm_first_token_duration` | Time from request send to first token received |
+
+Additional attributes (request headers, body fields, response fields) can be extracted and attached to logs or trace spans via the `attributes` configuration array.
+
+---
+
+## MCP Server Hosting
+
+Higress can host **Model Context Protocol (MCP) servers** through its plugin mechanism, allowing AI agents to call tools and services via the standardized MCP protocol.
+
+Key benefits of hosting MCP servers with Higress:
+
+<CardGroup cols={2}>
+  <Card title="Unified Auth" icon="key">
+    Apply the same authentication and authorization policies that govern your HTTP APIs to MCP tool calls.
+  </Card>
+  <Card title="Rate Limiting" icon="gauge-high">
+    Fine-grained rate limiting prevents tool-call abuse with per-consumer or per-IP limits.
+  </Card>
+  <Card title="Audit Logs" icon="file-lines">
+    All tool invocations pass through the gateway, producing complete audit trails.
+  </Card>
+  <Card title="Dynamic Updates" icon="arrow-rotate-right">
+    Update MCP server logic by deploying a new Wasm plugin — no connection drops, no downtime.
+  </Card>
+</CardGroup>
+
+Existing OpenAPI specifications can be converted into remote MCP servers using the [openapi-to-mcp](https://github.com/higress-group/openapi-to-mcpserver) tool, then hosted directly on Higress.
+
+---
+
+## Full AI Pipeline Example
+
+The following shows a WasmPlugin stack that wires together the complete AI pipeline for an OpenAI-compatible endpoint:
+
+```yaml
+# 1. Token rate limiting (auth phase, priority 600)
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-token-ratelimit
+  namespace: higress-system
+spec:
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-token-ratelimit:latest
+  phase: AUTHN
+  priority: 600
+  defaultConfig:
+    rule_name: global
+    global_threshold:
+      token_per_minute: 500000
+    redis:
+      serviceName: redis.default.svc.cluster.local
+---
+# 2. Semantic cache (auth phase, priority 10)
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-cache
+  namespace: higress-system
+spec:
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-cache:latest
+  phase: AUTHN
+  priority: 10
+  defaultConfig:
+    redis:
+      serviceName: redis.default.svc.cluster.local
+---
+# 3. Proxy to provider (default phase, priority 100)
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-proxy
+  namespace: higress-system
+spec:
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:latest
+  defaultConfig:
+    provider:
+      type: openai
+      apiTokens:
+        - "YOUR_OPENAI_API_TOKEN"
+---
+# 4. Observability (custom phase, priority 200)
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-statistics
+  namespace: higress-system
+spec:
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-statistics:latest
+```
+
+<Note>
+  Because Higress uses true streaming processing of request and response bodies, SSE streams from LLMs are processed chunk-by-chunk. In high-bandwidth AI scenarios this significantly reduces memory overhead compared to buffering entire responses.
+</Note>

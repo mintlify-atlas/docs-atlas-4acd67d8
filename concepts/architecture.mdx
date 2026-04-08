@@ -1,0 +1,146 @@
+---
+title: "Architecture"
+description: "How Higress's three core components — Gateway, Controller, and Console — work together to deliver millisecond config propagation with no traffic disruption."
+---
+
+Higress is built on Envoy and Istio and organized into three core components: **Higress Gateway** (data plane), **Higress Controller** (control plane), and **Higress Console** (management UI). Each component has a distinct role, and together they form a pipeline that turns Kubernetes resources into live Envoy configuration without ever reloading the proxy.
+
+## Components
+
+<CardGroup cols={3}>
+  <Card title="Higress Gateway" icon="server">
+    Data plane. Receives traffic, applies routing rules, runs Wasm plugins. Built on Envoy with a Pilot Agent sidecar.
+  </Card>
+  <Card title="Higress Controller" icon="gear">
+    Control plane. Watches Kubernetes resources, performs service discovery, translates config into xDS, and pushes it to the data plane.
+  </Card>
+  <Card title="Higress Console" icon="display">
+    Management UI. Provides a web interface for routes, plugins, domains, TLS certificates, and service sources.
+  </Card>
+</CardGroup>
+
+---
+
+## Higress Gateway
+
+The gateway is the data-plane component that handles actual request traffic. It contains two sub-components that communicate over a Unix Domain Socket (UDS):
+
+- **Pilot Agent** — bootstraps Envoy, manages its lifecycle, and proxies xDS requests from Envoy up to the Discovery component in the controller.
+- **Envoy** — the high-performance proxy engine. Receives xDS configuration from Pilot Agent and forwards traffic to upstream services.
+
+### Envoy core concepts
+
+| Concept | Role |
+|---|---|
+| Listener | Accepts connections from downstream clients. Discovered via LDS. |
+| Router | Matches requests to clusters using path, headers, etc. Discovered via RDS. |
+| Cluster | A logical group of upstream service instances. Discovered via CDS. |
+| Endpoint | A concrete IP:port within a cluster. Discovered via EDS. |
+| SSL/TLS | Certificate material fetched dynamically via SDS. |
+
+Because every Envoy component is discovered dynamically via xDS, **config changes take effect in milliseconds with no process reload** — eliminating the traffic jitter that affects Nginx-based gateways.
+
+---
+
+## Higress Controller
+
+The controller is Higress's control plane. It watches Kubernetes resources, aggregates service discovery data, translates everything into xDS-compatible structures, and pushes them to the gateway. It has two sub-components:
+
+### Discovery (Istio Pilot-Discovery)
+
+Discovery is the Istio component responsible for service discovery, configuration management, certificate issuance, and xDS delivery. It supports four `Config Controller` types:
+
+<Tabs>
+  <Tab title="Kubernetes">
+    Reads `Ingress`, `Gateway API`, and other Kubernetes CRD resources directly. This is the default source for Higress.
+  </Tab>
+  <Tab title="MCP over xDS">
+    Any server that implements the Mesh Configuration Protocol (MCP) can push config to Discovery. Higress Core acts as an MCP server, feeding translated Istio resources back into Discovery without coupling Higress to Kubernetes storage.
+  </Tab>
+  <Tab title="Memory / File">
+    In-memory and file-based controllers used for testing and local development.
+  </Tab>
+</Tabs>
+
+Config sources are declared in the `higress-config` ConfigMap inside the `higress-system` namespace:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: higress-config
+  namespace: higress-system
+data:
+  mesh: |-
+    configSources:
+    - address: xds://127.0.0.1:15051   # Higress Core (MCP server)
+    - address: k8s://                  # Kubernetes CRDs
+```
+
+#### Service Controller
+
+`Service Controller` manages service registries and feeds endpoint data into Discovery. Currently supports Kubernetes Service/Endpoint natively, with external registries (Nacos, Eureka, Consul, ZooKeeper) handled via the McpBridge CRD in Higress Core.
+
+### Higress Core
+
+Higress Core sits between Kubernetes and Discovery. It watches Kubernetes resources and translates them into Istio resources, which are pushed to Discovery via the MCP protocol. Higress Core contains six controllers:
+
+<Steps>
+  <Step title="Ingress Controller">
+    Watches `Ingress` resources and converts them to Istio `Gateway`, `VirtualService`, and `DestinationRule` objects.
+  </Step>
+  <Step title="Gateway Controller">
+    Watches Gateway API resources (`GatewayClass`, `Gateway`, `HTTPRoute`, etc.) and translates them to Istio resources.
+  </Step>
+  <Step title="McpBridge Controller">
+    Reads `McpBridge` CRDs and converts service registrations from Nacos, Eureka, Consul, and ZooKeeper into Istio `ServiceEntry` resources, making external microservices available as upstream clusters.
+  </Step>
+  <Step title="Http2Rpc Controller">
+    Watches `Http2Rpc` CRDs that define HTTP-to-RPC mappings, enabling HTTP clients to transparently call Dubbo or gRPC backends.
+  </Step>
+  <Step title="WasmPlugin Controller">
+    Watches `WasmPlugin` CRDs (Higress's extended version of the Istio WasmPlugin) and translates them into Istio `WasmPlugin` objects. Higress's extension adds support for global, route, domain, and service-level plugin scoping.
+  </Step>
+  <Step title="ConfigmapMgr">
+    Monitors the `higress-config` ConfigMap for global settings (tracing, gzip, MCP server, etc.) and generates `EnvoyFilter` resources accordingly.
+  </Step>
+</Steps>
+
+#### Cert Server
+
+The Cert Server sub-component of Higress Core manages Kubernetes `Secret` resources and handles automatic TLS certificate issuance and renewal, including integration with Let's Encrypt.
+
+---
+
+## Config Propagation Flow
+
+```
+Kubernetes Resources
+  (Ingress / Gateway API / WasmPlugin / McpBridge / Http2Rpc)
+        │
+        ▼
+  Higress Core
+  (translates to Istio resources, pushes via MCP/xDS)
+        │
+        ▼
+  Discovery (Istio Pilot-Discovery)
+  (merges all config sources, generates xDS)
+        │
+        ▼
+  Pilot Agent ──UDS──► Envoy
+  (proxies xDS)         (applies config in milliseconds)
+```
+
+<Note>
+  Because Envoy receives configuration through the xDS protocol rather than a config file reload, route and plugin changes propagate in milliseconds without dropping connections. This is particularly important for long-lived connections such as SSE and WebSocket streams used in AI workloads.
+</Note>
+
+---
+
+## Supported Kubernetes CRDs
+
+| CRD | API Group | Purpose |
+|---|---|---|
+| `WasmPlugin` | `extensions.higress.io/v1alpha1` | Attach Wasm plugins at global, domain, route, or service scope |
+| `McpBridge` | `networking.higress.io/v1` | Register external service registries (Nacos, Consul, ZooKeeper, Eureka) |
+| `Http2Rpc` | `networking.higress.io/v1` | Declare HTTP-to-Dubbo or HTTP-to-gRPC protocol conversion rules |

@@ -1,0 +1,230 @@
+---
+title: "Helm Deployment"
+description: "Deploy Higress on Kubernetes using Helm, with guidance on key values, mirror registries, and production configuration."
+---
+
+Higress ships a Helm chart that installs the controller, gateway, and optional components (console, Redis, observability stack) into your Kubernetes cluster in a single command.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="Kubernetes cluster" icon="layer-group">
+    A running cluster with `kubectl` configured. Kubernetes 1.21+ is recommended.
+  </Card>
+  <Card title="Helm 3" icon="wrench">
+    Install Helm 3 from [helm.sh](https://helm.sh/docs/intro/install/). Helm 2 is not supported.
+  </Card>
+</CardGroup>
+
+## Add the Higress Helm repository
+
+```bash
+helm repo add higress.io https://higress.io/helm-charts
+helm repo update
+```
+
+## Basic installation
+
+<Steps>
+  <Step title="Install Higress">
+    Install Higress into the `higress-system` namespace, creating it if it does not exist:
+
+    ```bash
+    helm install higress -n higress-system higress.io/higress \
+      --create-namespace \
+      --render-subchart-notes
+    ```
+  </Step>
+  <Step title="Verify the pods are running">
+    ```bash
+    kubectl get pods -n higress-system
+    ```
+
+    You should see `higress-controller` and `higress-gateway` pods in `Running` state.
+  </Step>
+  <Step title="Get the gateway address">
+    ```bash
+    kubectl get svc -n higress-system higress-gateway
+    ```
+
+    The `EXTERNAL-IP` field contains the LoadBalancer address. Use it to route traffic to the gateway.
+  </Step>
+</Steps>
+
+## Using mirror registries
+
+The default image registry (`higress-registry.cn-hangzhou.cr.aliyuncs.com`) is located in China. If you are deploying outside China, use a geographically closer mirror to improve pull performance.
+
+```bash
+helm install higress -n higress-system higress.io/higress \
+  --set global.hub=higress-registry.us-west-1.cr.aliyuncs.com \
+  --create-namespace
+```
+
+<Info>
+The `global.hub` value sets the registry prefix for all Higress component images (controller, gateway, plugins). The image paths under the hub follow the pattern `{hub}/higress/{image}` for core components and `{hub}/{pluginNamespace}/{plugin-name}` for built-in plugins.
+</Info>
+
+## Uninstalling
+
+```bash
+helm delete higress -n higress-system
+```
+
+This removes all Kubernetes resources created by the chart and deletes the Helm release. CRDs are retained by default (annotated with `helm.sh/resource-policy: keep`).
+
+---
+
+## Key Helm values
+
+The following tables cover the most commonly configured values. For the full parameter reference, run `helm show values higress.io/higress`.
+
+### Global settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `global.hub` | `higress-registry.cn-hangzhou.cr.aliyuncs.com` | Container image registry |
+| `global.ingressClass` | `higress` | IngressClass that the controller watches. Set to `nginx` to also capture unclassed resources. |
+| `global.watchNamespace` | `""` | Restrict controller to a single namespace. Empty means all namespaces. |
+| `global.enableIstioAPI` | `true` | Watch Istio CRDs (VirtualService, DestinationRule, etc.) |
+| `global.enableGatewayAPI` | `true` | Watch Gateway API resources |
+| `global.enableStatus` | `true` | Write gateway IP back to Ingress `.status`. Set `false` when migrating from Nginx Ingress to avoid conflicts. |
+| `global.enableRedis` | `false` | Deploy a bundled Redis instance for MCP server session storage |
+| `global.local` | `false` | Set `true` for local clusters (kind, minikube) to adjust rolling update defaults |
+| `global.logging.level` | `default:info` | Per-scope log level for all control-plane components |
+
+### Controller
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `controller.replicas` | `1` | Number of controller pods |
+| `controller.resources.requests.cpu` | `500m` | CPU request |
+| `controller.resources.requests.memory` | `2048Mi` | Memory request |
+| `controller.resources.limits.cpu` | `1000m` | CPU limit |
+| `controller.resources.limits.memory` | `2048Mi` | Memory limit |
+| `controller.autoscaling.enabled` | `false` | Enable HPA for the controller |
+| `controller.autoscaling.minReplicas` | `1` | Minimum HPA replicas |
+| `controller.autoscaling.maxReplicas` | `5` | Maximum HPA replicas |
+| `controller.autoscaling.targetCPUUtilizationPercentage` | `80` | HPA CPU target |
+| `controller.automaticHttps.enabled` | `true` | Enable automatic HTTPS certificate issuance |
+| `controller.automaticHttps.email` | `""` | Contact email for ACME certificate requests |
+
+### Gateway
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `gateway.replicas` | `2` | Number of gateway pods |
+| `gateway.kind` | `Deployment` | Use `DaemonSet` for node-pinned deployments |
+| `gateway.service.type` | `LoadBalancer` | Service type. Use `NodePort` or `ClusterIP` when a LoadBalancer is not available. |
+| `gateway.httpPort` | `80` | HTTP listener port |
+| `gateway.httpsPort` | `443` | HTTPS listener port |
+| `gateway.resources.requests.cpu` | `2000m` | CPU request |
+| `gateway.resources.requests.memory` | `2048Mi` | Memory request |
+| `gateway.resources.limits.cpu` | `2000m` | CPU limit |
+| `gateway.resources.limits.memory` | `2048Mi` | Memory limit |
+| `gateway.autoscaling.enabled` | `false` | Enable HPA for the gateway |
+| `gateway.metrics.enabled` | `false` | Create a `PodMonitor` or `VMPodScrape` for Prometheus scraping |
+| `gateway.hostNetwork` | `false` | Use host network (required for some bare-metal setups) |
+| `gateway.rollingMaxSurge` | `100%` | Maximum surge during rolling updates |
+| `gateway.rollingMaxUnavailable` | `25%` | Maximum unavailable pods during rolling updates |
+
+### Downstream connection settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `downstream.idleTimeout` | `180` | Downstream idle connection timeout (seconds) |
+| `downstream.maxRequestHeadersKb` | `60` | Maximum request header size (KB) |
+| `downstream.connectionBufferLimits` | `32768` | Per-connection buffer limit (bytes) |
+| `downstream.http2.maxConcurrentStreams` | `100` | HTTP/2 max concurrent streams per connection |
+| `downstream.routeTimeout` | `0` | Global route timeout in seconds. `0` means no timeout. |
+
+### Upstream connection settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `upstream.idleTimeout` | `10` | Upstream idle connection timeout (seconds) |
+| `upstream.connectionBufferLimits` | `10485760` | Per-connection buffer limit (bytes) |
+
+### Tracing
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `tracing.enable` | `false` | Enable distributed tracing |
+| `tracing.sampling` | `100` | Sampling rate (percentage) |
+| `tracing.timeout` | `500` | Trace export timeout (milliseconds) |
+
+### Gzip compression
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `gzip.enable` | `true` | Enable response compression |
+| `gzip.minContentLength` | `1024` | Minimum response size to compress (bytes) |
+| `gzip.compressionLevel` | `BEST_COMPRESSION` | zlib compression level |
+| `gzip.compressionStrategy` | `DEFAULT_STRATEGY` | zlib compression strategy |
+
+### Bundled Redis (for MCP server)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `global.enableRedis` | `false` | Enable the bundled Redis deployment |
+| `redis.redis.tag` | `7.4.0-v3` | Redis Stack Server image tag |
+| `redis.redis.replicas` | `1` | Number of Redis replicas |
+| `redis.redis.password` | `""` | Redis password. Leave empty for no authentication. |
+| `redis.redis.persistence.enabled` | `false` | Persist Redis data to a PersistentVolume |
+| `redis.redis.persistence.size` | `1Gi` | PersistentVolume size |
+| `redis.redis.service.port` | `6379` | Redis service port |
+
+---
+
+## Production considerations
+
+<Accordion title="Set resource limits appropriate for your traffic">
+  The default gateway resource limits (2 CPU / 2 GiB) are suitable for moderate traffic. Under heavy load, increase `gateway.resources.limits.cpu` and enable horizontal autoscaling:
+
+  ```bash
+  helm upgrade higress -n higress-system higress.io/higress \
+    --set gateway.autoscaling.enabled=true \
+    --set gateway.autoscaling.minReplicas=2 \
+    --set gateway.autoscaling.maxReplicas=10
+  ```
+</Accordion>
+
+<Accordion title="Enable Pod Disruption Budgets for the controller">
+  Prevent the controller from being fully evicted during node maintenance:
+
+  ```bash
+  helm upgrade higress -n higress-system higress.io/higress \
+    --set global.defaultPodDisruptionBudget.enabled=true
+  ```
+</Accordion>
+
+<Accordion title="Use DaemonSet mode for bare-metal clusters">
+  In bare-metal environments without a cloud LoadBalancer, deploy the gateway as a DaemonSet and use `hostNetwork: true` so that each node serves traffic directly:
+
+  ```bash
+  helm install higress -n higress-system higress.io/higress \
+    --set gateway.kind=DaemonSet \
+    --set gateway.hostNetwork=true \
+    --create-namespace
+  ```
+</Accordion>
+
+<Accordion title="Restrict namespace scope for multi-tenant clusters">
+  When each tenant namespace requires its own dedicated gateway, install Higress once per namespace and restrict its watch scope:
+
+  ```bash
+  helm install higress-team-a -n team-a higress.io/higress \
+    --set global.watchNamespace=team-a \
+    --create-namespace
+  ```
+</Accordion>
+
+<Accordion title="Use imagePullSecrets for private registries">
+  If your cluster pulls images from a private registry, create a pull secret and reference it:
+
+  ```bash
+  helm install higress -n higress-system higress.io/higress \
+    --set global.imagePullSecrets[0]=my-registry-secret \
+    --create-namespace
+  ```
+</Accordion>

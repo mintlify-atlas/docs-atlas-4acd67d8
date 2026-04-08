@@ -1,0 +1,145 @@
+---
+title: "AI Cache"
+description: "Cache LLM responses in Redis to reduce costs and latency. Supports both streaming and non-streaming responses with configurable cache keys and TTL."
+---
+
+The `ai-cache` plugin caches LLM responses in Redis. It works out of the box with the OpenAI protocol and supports both streaming (`text/event-stream`) and non-streaming responses.
+
+<Tip>
+  Send the request header `x-higress-skip-ai-cache: on` to bypass the cache for a specific request. The response from that request will also not be stored in the cache.
+</Tip>
+
+## Execution properties
+
+| Property | Value |
+|---|---|
+| Execution phase | Authentication Phase |
+| Priority | 10 |
+
+## Configuration
+
+### Cache key
+
+<ParamField path="cacheKeyFrom.requestBody" type="string">
+  [GJSON PATH](https://github.com/tidwall/gjson/blob/master/SYNTAX.md) expression to extract the cache key from the request body. Defaults to `messages.@reverse.0.content` (the content of the most recent message).
+</ParamField>
+
+<ParamField path="cacheKeyPrefix" type="string">
+  Prefix prepended to all Redis cache keys. Defaults to `higress-ai-cache:`.
+</ParamField>
+
+### Cache value
+
+<ParamField path="cacheValueFrom.responseBody" type="string">
+  GJSON PATH expression to extract the cached value from a non-streaming response body. Defaults to `choices.0.message.content`.
+</ParamField>
+
+<ParamField path="cacheStreamValueFrom.responseBody" type="string">
+  GJSON PATH expression to extract the cached value from a streaming response body. Defaults to `choices.0.delta.content`.
+</ParamField>
+
+### Cache TTL
+
+<ParamField path="cacheTTL" type="integer">
+  Cache expiration time in seconds. Defaults to `0`, which means entries never expire.
+</ParamField>
+
+### Response templates
+
+<ParamField path="returnResponseTemplate" type="string">
+  Template for the non-streaming HTTP response returned from cache. Use `%s` to mark where the cached value is inserted. Defaults to an OpenAI-compatible `chat.completion` response with `"id":"from-cache"`.
+</ParamField>
+
+<ParamField path="returnStreamResponseTemplate" type="string">
+  Template for the streaming (SSE) HTTP response returned from cache. Use `%s` to mark where the cached value is inserted. Defaults to an OpenAI-compatible streaming response followed by `data:[DONE]`.
+</ParamField>
+
+### Redis connection
+
+<ParamField path="redis.serviceName" type="string" required>
+  Full FQDN of the Redis service including service type, e.g., `my-redis.dns` or `redis.my-ns.svc.cluster.local`.
+</ParamField>
+
+<ParamField path="redis.servicePort" type="integer">
+  Redis service port. Defaults to `6379`.
+</ParamField>
+
+<ParamField path="redis.timeout" type="integer">
+  Timeout for Redis requests in milliseconds. Defaults to `1000`.
+</ParamField>
+
+<ParamField path="redis.username" type="string">
+  Redis username.
+</ParamField>
+
+<ParamField path="redis.password" type="string">
+  Redis password.
+</ParamField>
+
+<ParamField path="redis.database" type="integer">
+  Redis database ID. Defaults to `0`. Configuring `1` corresponds to `SELECT 1`.
+</ParamField>
+
+## Configuration examples
+
+### Minimal configuration
+
+```yaml
+redis:
+  serviceName: my-redis.dns
+  servicePort: 6379
+```
+
+### With TTL and custom timeout
+
+```yaml
+redis:
+  serviceName: my-redis.dns
+  timeout: 2000
+  servicePort: 6379
+  database: 1
+cacheTTL: 3600
+```
+
+### Custom cache key prefix
+
+```yaml
+redis:
+  serviceName: redis.default.svc.cluster.local
+  servicePort: 6379
+cacheKeyPrefix: "myapp-llm-cache:"
+cacheTTL: 86400
+```
+
+## Advanced: custom cache key expressions
+
+The default cache key expression `messages.@reverse.0.content` extracts the content of the most recent message (by reversing the array and taking the first element).
+
+GJSON PATH supports conditional syntax for more precise matching:
+
+```yaml
+# Use the content of the last message where role is "user"
+cacheKeyFrom:
+  requestBody: "messages.@reverse.#(role==\"user\").content"
+
+# Concatenate all user message contents as an array key
+cacheKeyFrom:
+  requestBody: "messages.@reverse.#(role==\"user\")#.content"
+
+# Use the second-to-last user message (pipeline syntax)
+cacheKeyFrom:
+  requestBody: "messages.@reverse.#(role==\"user\")#.content|1"
+```
+
+Use the [GJSON Playground](https://gjson.dev/) to test expressions against your request bodies.
+
+## Bypassing the cache
+
+Add the following header to skip cache lookup and storage for a specific request:
+
+```bash
+curl https://your-gateway/v1/chat/completions \
+  -H "x-higress-skip-ai-cache: on" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"What time is it?"}]}'
+```

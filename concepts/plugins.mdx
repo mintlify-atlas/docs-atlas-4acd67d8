@@ -1,0 +1,207 @@
+---
+title: "Plugins"
+description: "How Higress's Wasm plugin system works — sandbox isolation, supported languages, scoping rules, hot reload, and the official plugin library."
+---
+
+Higress extends Envoy's behavior through **WebAssembly (Wasm) plugins**. Every plugin runs inside a Wasm sandbox, providing memory safety and language portability. Plugins can be attached at multiple scopes, updated without dropping connections, and written in Go, Rust, or JavaScript/AssemblyScript.
+
+---
+
+## Why Wasm?
+
+<CardGroup cols={2}>
+  <Card title="Memory Safety" icon="shield-halved">
+    Each plugin runs in an isolated Wasm sandbox. A crash or memory error in a plugin cannot corrupt Envoy's memory or affect other plugins.
+  </Card>
+  <Card title="Multi-Language" icon="code">
+    Write plugins in Go, Rust, or JavaScript/AssemblyScript. Higress provides first-class Go SDK support via the `wasm-go` library.
+  </Card>
+  <Card title="Hot Reload" icon="arrow-rotate-right">
+    Plugin logic can be upgraded to a new Wasm binary at runtime. Envoy swaps the plugin with no connection drops and no process restart.
+  </Card>
+  <Card title="Independent Versioning" icon="tag">
+    Each plugin has its own version. Rolling out a new plugin version does not require redeploying the gateway or restarting other plugins.
+  </Card>
+</CardGroup>
+
+---
+
+## Plugin Scopes
+
+Higress extends the Istio `WasmPlugin` CRD with support for four configuration scopes. A single `WasmPlugin` resource carries a `defaultConfig` (applied globally) and a list of `matchRules` that override or disable the default for specific targets.
+
+| Scope | How to configure |
+|---|---|
+| **Global** | Set `spec.defaultConfig`. Applies to all traffic unless overridden. |
+| **Domain** | Add a `matchRule` with `domain: ["example.com"]`. |
+| **Route** | Add a `matchRule` with `ingress: ["namespace/ingress-name"]`. |
+| **Service** | Add a `matchRule` with `service: ["service-name.namespace.svc.cluster.local"]`. |
+
+### WasmPlugin CRD example
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: key-auth
+  namespace: higress-system
+spec:
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/key-auth:latest
+  phase: AUTHN
+  priority: 10
+  # Global default: require authentication
+  defaultConfig:
+    consumers:
+    - name: app-a
+      credential: "token-app-a"
+  # Route-level override: disable auth for public health endpoint
+  matchRules:
+  - ingress:
+    - default/health-check
+    configDisable: true
+```
+
+<Info>
+  `matchRules` are evaluated in order. The first rule that matches a request wins. If no rule matches, `defaultConfig` applies.
+</Info>
+
+---
+
+## Plugin Execution Phases
+
+Plugins are inserted into Envoy's filter chain at one of three declared phases:
+
+| Phase | `PluginPhase` value | Position in filter chain |
+|---|---|---|
+| Authentication | `AUTHN` | Before Istio auth filters |
+| Authorization | `AUTHZ` | After AUTHN, before AUTHZ filters |
+| Stats | `STATS` | After AUTHZ, before stats filters |
+| Default | `UNSPECIFIED_PHASE` | End of chain, just before Router |
+
+Within a phase, plugins are ordered by `priority` (descending). When priorities are equal, ordering is derived deterministically from the plugin's name and namespace.
+
+---
+
+## Plugin Lifecycle Hooks
+
+A Go plugin implements its behavior by registering handler functions for each processing stage via `wrapper.SetCtx`. Higress's Go SDK (`github.com/higress-group/wasm-go/pkg/wrapper`) provides the following hooks:
+
+| Hook | When it fires |
+|---|---|
+| `ProcessRequestHeadersBy` | After request headers arrive, before the body is read |
+| `ProcessRequestBodyBy` | After the full request body is buffered |
+| `ProcessResponseHeadersBy` | After upstream response headers arrive |
+| `ProcessResponseBodyBy` | After the full response body is buffered |
+| `ProcessStreamingResponseBodyBy` | For each chunk of a streaming response (e.g., SSE) |
+
+### Minimal Go plugin (hello-world)
+
+The `hello-world` extension in the Higress repository demonstrates the minimum structure of a plugin:
+
+```go
+package main
+
+import (
+    "net/http"
+
+    "github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
+    "github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
+    "github.com/higress-group/wasm-go/pkg/log"
+    "github.com/higress-group/wasm-go/pkg/wrapper"
+)
+
+func main() {}
+
+func init() {
+    wrapper.SetCtx(
+        "hello-world",
+        wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
+    )
+}
+
+type HelloWorldConfig struct{}
+
+func onHttpRequestHeaders(ctx wrapper.HttpContext, config HelloWorldConfig, log log.Log) types.Action {
+    err := proxywasm.AddHttpRequestHeader("hello", "world")
+    if err != nil {
+        log.Critical("failed to set request header")
+    }
+    proxywasm.SendHttpResponseWithDetail(http.StatusOK, "hello-world", nil, []byte("hello world"), -1)
+    return types.ActionContinue
+}
+```
+
+Key points:
+
+- `wrapper.SetCtx` registers the plugin name and its hook handlers.
+- Each handler receives a typed config struct, a context handle, and a logger.
+- Returning `types.ActionContinue` passes the request down the filter chain; returning `types.ActionPause` buffers it.
+
+---
+
+## Official Plugin Library
+
+Higress ships dozens of ready-to-use plugins covering AI, traffic management, and security. The plugins are available as OCI images hosted in the Higress registry.
+
+<Tabs>
+  <Tab title="AI Plugins">
+    | Plugin | Purpose |
+    |---|---|
+    | `ai-proxy` | Unified proxy for 30+ LLM providers with OpenAI and Claude protocol support |
+    | `ai-cache` | Semantic LLM response caching backed by Redis; supports streaming and non-streaming |
+    | `ai-token-ratelimit` | Token-based rate limiting (per second / minute / hour / day) with Redis-backed counters |
+    | `ai-statistics` | AI observability: input/output token counts, TTFT, model dimensions, log/trace integration |
+    | `ai-load-balancer` | LLM-aware load balancing: global least-request, prefix-cache affinity, endpoint metrics |
+    | `ai-prompt-decorator` | Prepend or append system/user messages to every LLM request |
+    | `ai-prompt-template` | Fill prompt templates with request-time variables |
+    | `ai-security-guard` | Content safety filtering for LLM inputs and outputs |
+    | `mcp-server` | Host Model Context Protocol (MCP) servers through Higress's plugin mechanism |
+  </Tab>
+  <Tab title="Traffic Management">
+    | Plugin | Purpose |
+    |---|---|
+    | `cluster-key-rate-limit` | Rate limit by header, query param, IP, consumer, or cookie |
+    | `cors` | Cross-Origin Resource Sharing header injection |
+    | `cache-control` | Response caching via `Cache-Control` semantics |
+    | `request-block` | Block requests matching URL, header, or body patterns |
+    | `transformer` | Rewrite request/response headers and bodies |
+    | `traffic-tag` | Tag requests for canary and A/B routing |
+    | `frontend-gray` | Gradual frontend rollout with cookie and header targeting |
+  </Tab>
+  <Tab title="Security">
+    | Plugin | Purpose |
+    |---|---|
+    | `key-auth` | API key authentication |
+    | `basic-auth` | HTTP Basic authentication |
+    | `jwt-auth` | JWT token validation |
+    | `hmac-auth-apisix` | HMAC request signing compatible with Apache APISIX |
+    | `oidc` | OpenID Connect authentication flow |
+    | `waf` | Web Application Firewall |
+    | `ip-restriction` | Allow/deny lists by IP or CIDR |
+    | `bot-detect` | Block known crawler and bot user agents |
+    | `ext-auth` | Delegate auth decisions to an external HTTP service |
+  </Tab>
+</Tabs>
+
+---
+
+## Building and Distributing a Plugin
+
+<Steps>
+  <Step title="Write the plugin">
+    Create a Go module, implement your config struct and hook handlers, and call `wrapper.SetCtx` in `init()`.
+  </Step>
+  <Step title="Build the Wasm binary">
+    Compile with `GOOS=wasip1 GOARCH=wasm go build -o plugin.wasm .` or use the Docker-based Higress build toolchain (`PLUGIN_NAME=my-plugin make build`).
+  </Step>
+  <Step title="Package as OCI image">
+    Push the `.wasm` file as an OCI artifact to any compatible registry (`oci://`, `https://`, or `file://` URLs are all accepted).
+  </Step>
+  <Step title="Apply a WasmPlugin CRD">
+    Create a `WasmPlugin` resource referencing the OCI image URL. The WasmPlugin Controller in Higress Core translates it to an Istio `WasmPlugin` and propagates it to Envoy via xDS.
+  </Step>
+</Steps>
+
+<Warning>
+  For OCI images referenced by a mutable tag (e.g., `latest`), the default pull policy is `Always`. For production deployments, reference images by digest (`@sha256:...`) or use `imagePullPolicy: IfNotPresent` with a fixed tag to avoid unintentional upgrades.
+</Warning>

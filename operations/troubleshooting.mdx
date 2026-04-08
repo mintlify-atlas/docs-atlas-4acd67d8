@@ -1,0 +1,322 @@
+---
+title: "Troubleshooting"
+description: "Diagnose and resolve common Higress issues: plugin loading errors, routing mismatches, AI provider failures, and more."
+---
+
+## Checking logs
+
+The first step for any issue is to inspect the logs of the relevant components.
+
+<Tabs>
+  <Tab title="Gateway logs">
+    ```bash
+    kubectl logs -n higress-system deploy/higress-gateway
+    ```
+
+    To follow live:
+
+    ```bash
+    kubectl logs -n higress-system deploy/higress-gateway -f
+    ```
+
+    The gateway pod contains two containers. Target a specific container:
+
+    ```bash
+    # Envoy data-plane logs
+    kubectl logs -n higress-system deploy/higress-gateway -c higress-gateway
+
+    # Pilot Agent logs
+    kubectl logs -n higress-system deploy/higress-gateway -c istio-proxy
+    ```
+  </Tab>
+  <Tab title="Controller logs">
+    ```bash
+    kubectl logs -n higress-system deploy/higress-controller
+    ```
+
+    The controller pod runs both the Higress Core and the Istio Discovery (pilot) process as containers named `higress-core` and `discovery`:
+
+    ```bash
+    kubectl logs -n higress-system deploy/higress-controller -c higress-core
+    kubectl logs -n higress-system deploy/higress-controller -c discovery
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Using hgctl for diagnostics
+
+`hgctl gateway-config` (alias `hgctl gc`) queries the Envoy admin API directly on a gateway pod to retrieve the current xDS configuration state.
+
+### List listeners
+
+```bash
+hgctl gateway-config listener <pod-name> -n higress-system
+```
+
+Short form:
+
+```bash
+hgctl gc l <pod-name> -n higress-system
+```
+
+Output formats: `short` (default table), `json`, `yaml`:
+
+```bash
+hgctl gc l <pod-name> -n higress-system -o yaml
+```
+
+### Inspect routes
+
+```bash
+hgctl gateway-config route <pod-name> -n higress-system
+```
+
+Short form:
+
+```bash
+hgctl gc r <pod-name> -n higress-system
+```
+
+### Inspect endpoints
+
+```bash
+hgctl gateway-config endpoint <pod-name> -n higress-system
+```
+
+Short form:
+
+```bash
+hgctl gc e <pod-name> -n higress-system
+```
+
+### Inspect clusters
+
+```bash
+hgctl gateway-config cluster <pod-name> -n higress-system
+```
+
+### Full xDS configuration dump
+
+```bash
+hgctl gateway-config all <pod-name> -n higress-system -o yaml
+```
+
+<Tip>
+To find the pod name, run `kubectl get pods -n higress-system -l app=higress-gateway`.
+</Tip>
+
+---
+
+## Accessing the console
+
+The Higress Console is deployed as a separate pod in the `higress-system` namespace (label `app.kubernetes.io/name=higress-console`). `hgctl dashboard` opens a local port-forward and launches the UI in your browser.
+
+```bash
+hgctl dashboard console
+```
+
+You can also access other dashboards:
+
+```bash
+# Prometheus
+hgctl dashboard prometheus
+
+# Grafana
+hgctl dashboard grafana
+
+# Envoy admin UI for a specific gateway pod
+hgctl dashboard envoy higress-gateway-<pod-suffix>
+
+# Controller debug UI
+hgctl dashboard controller
+```
+
+All dashboard commands accept `--port` to set the local forwarded port and `--browser=false` to print the URL without opening a browser.
+
+---
+
+## Common issues
+
+### Plugin not loading / WasmPlugin configuration errors
+
+<Accordion title="Plugin OCI image cannot be pulled">
+  **Symptom:** Gateway logs contain `failed to pull Wasm module` or pods are stuck with `ImagePullBackOff`.
+
+  **Cause:** The default plugin registry (`higress-registry.cn-hangzhou.cr.aliyuncs.com`) may be unreachable from your cluster.
+
+  **Fix:** Set `global.hub` to a mirror registry, or set `imagePullSecret` on the `WasmPlugin` resource if the registry requires authentication:
+
+  ```yaml
+  spec:
+    url: oci://my-registry.example.com/plugins/request-block:1.0.0
+    imagePullSecret: my-registry-secret
+    imagePullPolicy: IfNotPresent
+  ```
+</Accordion>
+
+<Accordion title="Plugin loads but configuration is not applied">
+  **Symptom:** The `WasmPlugin` resource exists but the plugin behaviour is not observed on requests.
+
+  **Cause 1:** The `matchRules` scope does not match the incoming request. Verify that the ingress name, domain, or service value in `matchRules` exactly matches the target resource (namespace-qualified for ingress: `<namespace>/<ingress-name>`).
+
+  **Cause 2:** `defaultConfigDisable: true` is set without any matching `matchRules`.
+
+  **Cause 3:** The plugin is in `FAIL_OPEN` mode and encountered a fatal startup error. Check the gateway logs for Wasm-related errors.
+</Accordion>
+
+<Accordion title="WasmPlugin update not taking effect">
+  **Symptom:** After editing a `WasmPlugin`, the gateway continues using the old behaviour.
+
+  **Fix:** If `imagePullPolicy` is `IfNotPresent` (default), the gateway does not re-pull the image. Either change the image tag to a new value or set `imagePullPolicy: Always`. Then restart the gateway pods:
+
+  ```bash
+  kubectl rollout restart deployment/higress-gateway -n higress-system
+  ```
+</Accordion>
+
+---
+
+### Route not matching
+
+<Accordion title="Ingress resource is ignored">
+  **Symptom:** Requests are not routed despite an Ingress resource being present.
+
+  **Check 1 — IngressClass:** Verify the ingress has the correct class:
+
+  ```bash
+  kubectl get ingress <name> -n <namespace> -o jsonpath='{.spec.ingressClassName}'
+  ```
+
+  The value must match `global.ingressClass` (default: `higress`). If you set `global.ingressClass=nginx`, Higress will also watch resources with no class set.
+
+  **Check 2 — Controller recognition:** Confirm the controller has loaded the ingress by inspecting its logs or the route config:
+
+  ```bash
+  hgctl gc r <pod-name> -n higress-system | grep <ingress-name>
+  ```
+</Accordion>
+
+<Accordion title="Path not matching as expected">
+  **Symptom:** Requests to a specific path return 404 even though an Ingress rule covers it.
+
+  **Cause:** Kubernetes Ingress supports three `pathType` values: `Exact`, `Prefix`, and `ImplementationSpecific`. Higress follows standard semantics:
+
+  - `Exact` — the full path must match literally.
+  - `Prefix` — the path must begin with the specified prefix (component-aware, not a raw string match).
+  - `ImplementationSpecific` — interpreted as a regex in Higress.
+
+  Verify your `pathType` and path value are consistent:
+
+  ```yaml
+  paths:
+  - path: /api
+    pathType: Prefix   # matches /api, /api/v1, /api/users
+  ```
+</Accordion>
+
+---
+
+### AI provider connection failures
+
+<Accordion title="API key rejected (401 Unauthorized)">
+  **Symptom:** Upstream AI provider returns `401 Unauthorized`.
+
+  **Cause:** The API key configured in the `ai-proxy` WasmPlugin is incorrect, expired, or belongs to a different environment.
+
+  **Fix:** Verify the key value in the plugin configuration. Store keys in a Kubernetes Secret and reference it, rather than embedding the value directly in the plugin config.
+</Accordion>
+
+<Accordion title="Timeout connecting to AI provider">
+  **Symptom:** Requests to AI endpoints return `504 Gateway Timeout` or the gateway logs show upstream connection timeouts.
+
+  **Check:** The default global route timeout is `0` (no timeout). If a specific ingress sets a short timeout via the `higress.io/timeout` annotation, streaming responses from AI providers may be truncated.
+
+  **Fix:** Increase the timeout annotation on the affected ingress:
+
+  ```yaml
+  metadata:
+    annotations:
+      higress.io/timeout: "300"   # seconds
+  ```
+
+  Also verify that `upstream.idleTimeout` (default: `10` seconds) is long enough for the provider to respond.
+</Accordion>
+
+---
+
+### Performance issues
+
+<Accordion title="High memory usage on the gateway">
+  **Symptom:** Gateway pods are OOM-killed or memory usage grows over time.
+
+  **Check:** Each Wasm plugin is loaded into the Envoy VM and consumes memory. Check the number of active WasmPlugin resources:
+
+  ```bash
+  kubectl get wasmplugins -n higress-system
+  ```
+
+  The default gateway memory limit is `2048Mi`. Increase it if you have many plugins or high concurrent traffic:
+
+  ```bash
+  helm upgrade higress -n higress-system higress.io/higress \
+    --set gateway.resources.limits.memory=4096Mi
+  ```
+</Accordion>
+
+<Accordion title="High CPU on the controller">
+  **Symptom:** The `higress-controller` pod consumes excessive CPU during configuration reconciliation.
+
+  **Cause:** A large number of Ingress, Gateway API, or WasmPlugin resources can increase reconciliation time, especially when `global.enableIstioAPI` and `global.enableGatewayAPI` are both active.
+
+  **Fix:** Enable HPA for the controller and review whether you need all watched resource types:
+
+  ```bash
+  helm upgrade higress -n higress-system higress.io/higress \
+    --set controller.autoscaling.enabled=true \
+    --set controller.autoscaling.maxReplicas=3
+  ```
+</Accordion>
+
+---
+
+### Image pull failures
+
+<Accordion title="ImagePullBackOff for Higress components">
+  **Symptom:** Controller or gateway pods show `ImagePullBackOff` in `kubectl get pods`.
+
+  **Cause:** The default registry (`higress-registry.cn-hangzhou.cr.aliyuncs.com`) is unreachable from your network.
+
+  **Fix:** Switch to the US West mirror:
+
+  ```bash
+  helm upgrade higress -n higress-system higress.io/higress \
+    --set global.hub=higress-registry.us-west-1.cr.aliyuncs.com
+  ```
+
+  For air-gapped environments, mirror the images to your private registry and set `global.hub` accordingly. If authentication is required, create an image pull secret and add it:
+
+  ```bash
+  helm upgrade higress -n higress-system higress.io/higress \
+    --set global.hub=my.private.registry \
+    --set global.imagePullSecrets[0]=my-registry-secret
+  ```
+</Accordion>
+
+---
+
+### Diagnosing configuration sync problems
+
+If you suspect that the controller is not pushing updated configuration to the gateway, use the full xDS dump to inspect what the gateway currently has loaded:
+
+```bash
+# Get a gateway pod name
+POD=$(kubectl get pods -n higress-system -l app=higress-gateway \
+  -o jsonpath='{.items[0].metadata.name}')
+
+# Dump all xDS config (listeners, routes, clusters, endpoints)
+hgctl gateway-config all $POD -n higress-system -o yaml > /tmp/xds-dump.yaml
+```
+
+Compare the routes in the dump against your Ingress resources. If routes are missing, check the controller logs for reconciliation errors and verify that the Ingress `ingressClassName` is set correctly.

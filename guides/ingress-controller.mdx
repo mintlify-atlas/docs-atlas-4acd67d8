@@ -1,0 +1,315 @@
+---
+title: "Ingress Controller"
+description: "Use Higress as a Kubernetes ingress controller with nginx-compatible annotations, Gateway API support, and advanced service discovery."
+---
+
+Higress functions as a full Kubernetes ingress controller. It implements the `networking.k8s.io/v1` Ingress API and is compatible with many nginx-ingress annotations, making migration straightforward. It also extends Kubernetes routing with its own CRDs for service discovery (`McpBridge`) and protocol translation (`Http2Rpc`).
+
+## Installation
+
+Install Higress with Helm using `higress` as the ingress class name:
+
+```bash
+helm repo add higress.io https://higress.io/helm-charts
+helm install higress -n higress-system higress.io/higress \
+  --create-namespace \
+  --set global.ingressClass=higress
+```
+
+For a specific registry mirror (e.g., North America):
+
+```bash
+helm install higress -n higress-system higress.io/higress \
+  --create-namespace \
+  --set global.hub=higress-registry.us-west-1.cr.aliyuncs.com
+```
+
+## Basic Ingress configuration
+
+Set `ingressClassName: higress` on any Ingress resource for Higress to handle it:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  ingressClassName: higress
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: my-app-svc
+            port:
+              number: 80
+```
+
+### TLS termination
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app-tls
+  namespace: default
+spec:
+  ingressClassName: higress
+  tls:
+  - hosts:
+    - app.example.com
+    secretName: my-app-tls-secret
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: my-app-svc
+            port:
+              number: 80
+```
+
+## Supported annotations
+
+Higress supports the following commonly used nginx-ingress annotations:
+
+<CardGroup cols={2}>
+  <Card title="Rewrite & Routing">
+    - `nginx.ingress.kubernetes.io/rewrite-target`
+    - `nginx.ingress.kubernetes.io/use-regex`
+    - `nginx.ingress.kubernetes.io/upstream-vhost`
+  </Card>
+  <Card title="CORS">
+    - `nginx.ingress.kubernetes.io/enable-cors`
+    - `nginx.ingress.kubernetes.io/cors-allow-origin`
+    - `nginx.ingress.kubernetes.io/cors-allow-methods`
+    - `nginx.ingress.kubernetes.io/cors-allow-headers`
+  </Card>
+  <Card title="Backend Protocol">
+    - `higress.io/backend-protocol` (`HTTP`, `HTTPS`, `GRPC`, `GRPCS`)
+    - `higress.io/proxy-ssl-name`
+    - `higress.io/proxy-ssl-server-name`
+  </Card>
+  <Card title="Traffic Management">
+    - `nginx.ingress.kubernetes.io/proxy-connect-timeout`
+    - `nginx.ingress.kubernetes.io/proxy-read-timeout`
+    - `nginx.ingress.kubernetes.io/proxy-send-timeout`
+    - `nginx.ingress.kubernetes.io/proxy-body-size`
+  </Card>
+</CardGroup>
+
+### Destination override
+
+Use `higress.io/destination` to route to a service registered via McpBridge instead of a Kubernetes service:
+
+```yaml
+metadata:
+  annotations:
+    higress.io/backend-protocol: HTTPS
+    higress.io/destination: openai.dns
+    higress.io/proxy-ssl-name: api.openai.com
+    higress.io/proxy-ssl-server-name: "on"
+```
+
+## Gateway API migration
+
+Higress supports the Kubernetes Gateway API (`gateway.networking.k8s.io`). This is the recommended API for new deployments as it provides richer semantics and better separation of concerns.
+
+### HTTPRoute example
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  parentRefs:
+  - name: higress-gateway
+    namespace: higress-system
+  hostnames:
+  - app.example.com
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api
+    backendRefs:
+    - name: my-app-svc
+      port: 80
+```
+
+### Migrating from Ingress to HTTPRoute
+
+| Ingress field | HTTPRoute equivalent |
+|---|---|
+| `spec.rules[].host` | `spec.hostnames[]` |
+| `spec.rules[].http.paths[].path` | `spec.rules[].matches[].path.value` |
+| `spec.rules[].http.paths[].pathType: Prefix` | `path.type: PathPrefix` |
+| `spec.rules[].http.paths[].pathType: Exact` | `path.type: Exact` |
+| `spec.tls[].secretName` | `spec.parentRefs[].sectionName` with a TLS-configured `Gateway` listener |
+| Annotation: rewrite-target | `spec.rules[].filters[].urlRewrite` |
+| Annotation: header manipulation | `spec.rules[].filters[].requestHeaderModifier` |
+
+## Service discovery with McpBridge
+
+The `McpBridge` CRD enables Higress to discover services from external registries including Nacos, Consul, ZooKeeper, Eureka, and DNS. This is useful for services that are not deployed as Kubernetes resources.
+
+### DNS-based upstream
+
+Register an external hostname (e.g., a cloud AI provider API):
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: default
+  namespace: higress-system
+spec:
+  registries:
+  - domain: api.openai.com
+    name: openai
+    port: 443
+    type: dns
+  - domain: api.anthropic.com
+    name: claude
+    port: 443
+    type: dns
+```
+
+### Nacos service registry
+
+Discover services registered in Nacos:
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: nacos-bridge
+  namespace: higress-system
+spec:
+  registries:
+  - type: nacos2
+    name: nacos-prod
+    domain: nacos.default.svc.cluster.local
+    port: 8848
+    nacosGroups:
+    - DEFAULT_GROUP
+    nacosNamespaceId: "public"
+```
+
+### Consul service registry
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: consul-bridge
+  namespace: higress-system
+spec:
+  registries:
+  - type: consul
+    name: consul-prod
+    domain: consul.default.svc.cluster.local
+    port: 8500
+```
+
+### Eureka service registry
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: eureka-bridge
+  namespace: higress-system
+spec:
+  registries:
+  - type: eureka
+    name: eureka-prod
+    domain: eureka.default.svc.cluster.local
+    port: 8761
+```
+
+Once registered, reference discovered services in an Ingress using the `higress.io/destination` annotation in the format `<service-name>.<registry-name>`:
+
+```yaml
+metadata:
+  annotations:
+    higress.io/destination: user-service.nacos-prod
+```
+
+## gRPC routing
+
+Higress natively supports gRPC. Set the backend protocol annotation to `GRPC` or `GRPCS`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grpc-service
+  namespace: default
+  annotations:
+    higress.io/backend-protocol: GRPC
+spec:
+  ingressClassName: higress
+  rules:
+  - host: grpc.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grpc-svc
+            port:
+              number: 9090
+```
+
+For gRPC with TLS on the backend:
+
+```yaml
+annotations:
+  higress.io/backend-protocol: GRPCS
+  higress.io/proxy-ssl-name: grpc.example.com
+  higress.io/proxy-ssl-server-name: "on"
+```
+
+## Dubbo routing with Http2Rpc
+
+The `Http2Rpc` CRD lets Higress translate inbound HTTP/1.1 requests into Dubbo RPC calls. This allows existing HTTP clients to invoke Dubbo services without any client-side changes.
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: Http2Rpc
+metadata:
+  name: dubbo-user-service
+  namespace: default
+spec:
+  dubbo:
+    service: com.example.UserService
+    version: "1.0.0"
+    group: "default"
+    methods:
+    - serviceMethod: getUserById
+      headersAttach: "*"
+      httpPath: /user/{id}
+      httpMethod:
+      - GET
+      httpParamOptsFromPath:
+      - paramKey: id
+        paramSource: PATH
+        paramType: "java.lang.Long"
+```
+
+Incoming `GET /user/42` is translated to a Dubbo call `getUserById(42L)` on the `com.example.UserService` interface.
+
+<Note>
+The `Http2Rpc` CRD requires that the Dubbo service be discoverable via a registered McpBridge (e.g., Nacos or ZooKeeper), which is the typical deployment pattern for Dubbo microservices.
+</Note>

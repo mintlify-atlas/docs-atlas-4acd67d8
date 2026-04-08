@@ -1,0 +1,226 @@
+---
+title: "AI Security Guard"
+description: "Content safety filtering for LLM inputs and outputs using Alibaba Cloud Content Security. Blocks harmful or non-compliant content before it reaches the model or the user."
+---
+
+The `ai-security-guard` plugin integrates with Alibaba Cloud's content security service to inspect LLM inputs (user prompts) and outputs (model responses). It ensures that application content remains legal and compliant.
+
+## Execution properties
+
+| Property | Value |
+|---|---|
+| Execution phase | Custom Phase |
+| Priority | 300 |
+
+## Observability
+
+**Metrics** reported by this plugin:
+
+| Metric | Description |
+|---|---|
+| `ai_sec_request_deny` | Number of requests denied at the request phase |
+| `ai_sec_response_deny` | Number of requests denied at the response phase |
+
+**Trace span attributes** added by this plugin:
+
+| Attribute | Description |
+|---|---|
+| `ai_sec_risklabel` | Risk type identified for the request |
+| `ai_sec_deny_phase` | Phase where the request was denied: `request` or `response` |
+
+## Configuration
+
+### Service connection
+
+<ParamField path="serviceName" type="string" required>
+  Higress backend service name for the content security endpoint.
+</ParamField>
+
+<ParamField path="servicePort" type="string" required>
+  Port of the content security service.
+</ParamField>
+
+<ParamField path="serviceHost" type="string" required>
+  Host of the Alibaba Cloud content security service endpoint (e.g., `green-cip.cn-shanghai.aliyuncs.com`).
+</ParamField>
+
+<ParamField path="accessKey" type="string" required>
+  Alibaba Cloud AccessKey ID.
+</ParamField>
+
+<ParamField path="secretKey" type="string" required>
+  Alibaba Cloud AccessKey Secret.
+</ParamField>
+
+<ParamField path="action" type="string" required>
+  Alibaba Cloud AI guardrails business interface name.
+</ParamField>
+
+### Detection options
+
+<ParamField path="checkRequest" type="boolean">
+  Check whether the LLM input (user prompt) is compliant. Defaults to `false`.
+</ParamField>
+
+<ParamField path="checkResponse" type="boolean">
+  Check whether the LLM output (model response) is compliant. Defaults to `false`.
+</ParamField>
+
+<ParamField path="requestCheckService" type="string">
+  Alibaba Cloud service name used for input detection. Defaults to `llm_query_moderation`.
+</ParamField>
+
+<ParamField path="responseCheckService" type="string">
+  Alibaba Cloud service name used for output detection. Defaults to `llm_response_moderation`.
+</ParamField>
+
+### Content extraction
+
+<ParamField path="requestContentJsonPath" type="string">
+  GJSON PATH expression to locate the content to inspect in the request body. Defaults to `messages.@reverse.0.content`.
+</ParamField>
+
+<ParamField path="responseContentJsonPath" type="string">
+  GJSON PATH expression to locate the content to inspect in a non-streaming response body. Defaults to `choices.0.message.content`.
+</ParamField>
+
+<ParamField path="responseStreamContentJsonPath" type="string">
+  GJSON PATH expression to locate the content to inspect in a streaming response body. Defaults to `choices.0.delta.content`.
+</ParamField>
+
+### Denial response
+
+<ParamField path="denyCode" type="integer">
+  HTTP status code returned when content is blocked. Defaults to `200`.
+</ParamField>
+
+<ParamField path="denyMessage" type="string">
+  Response body returned when content is blocked. Defaults to an OpenAI-format response where the assistant's content contains Alibaba Cloud's suggested safe reply.
+</ParamField>
+
+<ParamField path="protocol" type="string">
+  Response format for denial messages. `openai` (default) or `original`.
+</ParamField>
+
+### Risk thresholds
+
+<ParamField path="contentModerationLevelBar" type="string">
+  Minimum risk level to trigger a block for content moderation. Options: `max`, `high`, `medium`, `low`. Defaults to `max`.
+</ParamField>
+
+<ParamField path="promptAttackLevelBar" type="string">
+  Minimum risk level to trigger a block for prompt injection attacks. Options: `max`, `high`, `medium`, `low`. Defaults to `max`.
+</ParamField>
+
+<ParamField path="sensitiveDataLevelBar" type="string">
+  Minimum risk level to trigger a block for sensitive data. Options: `S4`, `S3`, `S2`, `S1`. Defaults to `S4`.
+</ParamField>
+
+### Performance
+
+<ParamField path="timeout" type="integer">
+  Timeout for calls to the content security service in milliseconds. Defaults to `2000`.
+</ParamField>
+
+<ParamField path="bufferLimit" type="integer">
+  Maximum length of each text chunk sent to the content security service. Defaults to `1000`.
+</ParamField>
+
+### Per-consumer overrides
+
+<ParamField path="consumerRequestCheckService" type="map">
+  Map of consumer name to request check service name. Overrides `requestCheckService` for specific consumers.
+</ParamField>
+
+<ParamField path="consumerResponseCheckService" type="map">
+  Map of consumer name to response check service name. Overrides `responseCheckService` for specific consumers.
+</ParamField>
+
+<ParamField path="consumerRiskLevel" type="map">
+  Map of consumer name to risk level overrides for different detection dimensions.
+</ParamField>
+
+## Denial response body
+
+When content is blocked, the plugin returns a structured JSON object. The `MultiModalGuard` action uses the following format:
+
+```json
+{
+  "blockedDetails": [
+    {
+      "Type": "contentModeration",
+      "Level": "high",
+      "Suggestion": "block"
+    }
+  ],
+  "requestId": "AAAAAA-BBBB-CCCC-DDDD-EEEEEEE****",
+  "guardCode": 200
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `blockedDetails` | array | Details of triggered blocking dimensions |
+| `blockedDetails[].Type` | string | Risk type: `contentModeration`, `promptAttack`, `sensitiveData`, `maliciousUrl`, or `modelHallucination` |
+| `blockedDetails[].Level` | string | Risk level: `high`, `medium`, `low` |
+| `blockedDetails[].Suggestion` | string | Action recommended by the security service, typically `block` |
+| `requestId` | string | Tracing ID from the security service |
+| `guardCode` | integer | Business code from the security service (`200` = risk detected) |
+
+The blocked body is embedded differently depending on the protocol and response type:
+
+| Context | Placement |
+|---|---|
+| OpenAI non-streaming | Serialized as JSON string in `choices[0].message.content` |
+| OpenAI streaming SSE | Serialized as JSON string in `delta.content` of the first chunk |
+| `protocol=original` | Returned directly as the JSON response body |
+| Image generation | Returned directly as the JSON response body (HTTP 403) |
+| MCP (JSON-RPC) | Serialized as JSON string in `error.message` |
+| MCP (SSE) | Serialized as JSON string returned via SSE event |
+
+## Configuration examples
+
+### Check requests only
+
+```yaml
+serviceName: safecheck.dns
+servicePort: 443
+serviceHost: "green-cip.cn-shanghai.aliyuncs.com"
+accessKey: "YOUR_ACCESS_KEY"
+secretKey: "YOUR_SECRET_KEY"
+action: "textModeration"
+checkRequest: true
+```
+
+### Check both requests and responses
+
+```yaml
+serviceName: safecheck.dns
+servicePort: 443
+serviceHost: green-cip.cn-shanghai.aliyuncs.com
+accessKey: "YOUR_ACCESS_KEY"
+secretKey: "YOUR_SECRET_KEY"
+action: "textModeration"
+checkRequest: true
+checkResponse: true
+```
+
+### Custom risk thresholds
+
+```yaml
+serviceName: safecheck.dns
+servicePort: 443
+serviceHost: green-cip.cn-shanghai.aliyuncs.com
+accessKey: "YOUR_ACCESS_KEY"
+secretKey: "YOUR_SECRET_KEY"
+action: "textModeration"
+checkRequest: true
+checkResponse: true
+contentModerationLevelBar: high
+promptAttackLevelBar: medium
+sensitiveDataLevelBar: S3
+```
+
+<Warning>
+  Lowering the risk thresholds (e.g., from `max` to `medium`) increases sensitivity and may result in more false positives. Test thoroughly before deploying to production.
+</Warning>

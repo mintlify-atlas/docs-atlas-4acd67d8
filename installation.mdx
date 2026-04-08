@@ -1,0 +1,299 @@
+---
+title: "Installation"
+description: "Install Higress using Docker, Helm on Kubernetes, or the hgctl CLI."
+---
+
+Higress supports several installation methods. Choose the one that matches your environment.
+
+<CardGroup cols={3}>
+  <Card title="Docker" icon="docker">
+    Single-machine deployment. Ideal for local development and simple sites.
+  </Card>
+  <Card title="Helm" icon="dharmachakra">
+    Kubernetes deployment. Recommended for production clusters.
+  </Card>
+  <Card title="hgctl" icon="terminal">
+    CLI tool for Kubernetes and local Docker deployments with interactive profile selection.
+  </Card>
+</CardGroup>
+
+---
+
+## Docker
+
+The all-in-one Docker image runs the Higress gateway, controller, and console as a single process. It writes configuration to a mounted directory so state persists across container restarts.
+
+```bash
+mkdir higress && cd higress
+docker run -d --rm --name higress-ai -v ${PWD}:/data \
+  -p 8001:8001 -p 8080:8080 -p 8443:8443 \
+  higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest
+```
+
+**Port reference:**
+
+| Port | Purpose |
+|------|---------|
+| `8001` | Higress UI console |
+| `8080` | Gateway HTTP entry point |
+| `8443` | Gateway HTTPS entry point |
+
+**Mirror registries**
+
+If you experience timeouts pulling from the default registry, replace the image prefix with a registry closer to your location:
+
+| Region | Registry |
+|--------|---------|
+| China (Hangzhou) | `higress-registry.cn-hangzhou.cr.aliyuncs.com` (default) |
+| North America | `higress-registry.us-west-1.cr.aliyuncs.com` |
+| Southeast Asia | `higress-registry.ap-southeast-7.cr.aliyuncs.com` |
+
+For example, to use the North America mirror:
+
+```bash
+docker run -d --rm --name higress-ai -v ${PWD}:/data \
+  -p 8001:8001 -p 8080:8080 -p 8443:8443 \
+  higress-registry.us-west-1.cr.aliyuncs.com/higress/all-in-one:latest
+```
+
+See the [Quickstart](/quickstart) for a full walkthrough of the Docker installation, including creating your first route.
+
+---
+
+## Helm
+
+<Note>
+  Helm deployment requires a running Kubernetes cluster and [Helm 3](https://helm.sh/docs/intro/install/) installed.
+</Note>
+
+### Add the Higress Helm repository
+
+```bash
+helm repo add higress.io https://higress.io/helm-charts
+helm repo update
+```
+
+### Install
+
+```bash
+helm install higress -n higress-system higress.io/higress \
+  --create-namespace \
+  --render-subchart-notes
+```
+
+This installs Higress into the `higress-system` namespace and creates the namespace if it does not exist.
+
+### Mirror registry for Kubernetes deployments
+
+The `global.hub` parameter controls the container registry used for all Higress component images and built-in Wasm plugin images. Set it to a mirror closer to your cluster:
+
+<Tabs>
+  <Tab title="China (default)">
+    ```bash
+    helm install higress -n higress-system higress.io/higress \
+      --create-namespace \
+      --set global.hub=higress-registry.cn-hangzhou.cr.aliyuncs.com
+    ```
+  </Tab>
+  <Tab title="North America">
+    ```bash
+    helm install higress -n higress-system higress.io/higress \
+      --create-namespace \
+      --set global.hub=higress-registry.us-west-1.cr.aliyuncs.com
+    ```
+  </Tab>
+  <Tab title="Southeast Asia">
+    ```bash
+    helm install higress -n higress-system higress.io/higress \
+      --create-namespace \
+      --set global.hub=higress-registry.ap-southeast-7.cr.aliyuncs.com
+    ```
+  </Tab>
+</Tabs>
+
+### Key Helm values
+
+The following values are the most commonly configured. See the full values table for all options.
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `global.hub` | `higress-registry.cn-hangzhou.cr.aliyuncs.com` | Container registry for all images |
+| `global.ingressClass` | `higress` | Ingress class to watch. Set to `nginx` to also watch nginx-class resources |
+| `global.enableGatewayAPI` | `true` | Enable Kubernetes Gateway API resource support |
+| `global.enableIstioAPI` | `true` | Enable Istio resource support |
+| `global.watchNamespace` | `""` | Restrict controller to a single namespace. Empty means watch all namespaces |
+| `gateway.replicas` | `2` | Number of gateway pods |
+| `gateway.kind` | `Deployment` | Use `DaemonSet` instead of `Deployment` if needed |
+| `gateway.httpPort` | `80` | Gateway HTTP port |
+| `gateway.httpsPort` | `443` | Gateway HTTPS port |
+| `gateway.service.type` | `LoadBalancer` | Kubernetes service type for the gateway |
+| `controller.replicas` | `1` | Number of controller pods |
+| `controller.automaticHttps.enabled` | `true` | Automatic TLS via Let's Encrypt |
+| `controller.automaticHttps.email` | `""` | Email address for Let's Encrypt registration |
+| `global.enableStatus` | `true` | Write entry IP to Ingress `.status` field. Set to `false` when migrating from nginx ingress |
+
+### Example: local kind cluster
+
+When deploying to a local cluster such as kind, set `global.local` to configure appropriate defaults:
+
+```bash
+helm install higress -n higress-system higress.io/higress \
+  --create-namespace \
+  --set global.local=true
+```
+
+### Example: single-namespace isolation
+
+To confine Higress to watch only one namespace:
+
+```bash
+helm install higress -n higress-system higress.io/higress \
+  --create-namespace \
+  --set global.watchNamespace=my-app-namespace
+```
+
+### Example: custom resource limits
+
+```bash
+helm install higress -n higress-system higress.io/higress \
+  --create-namespace \
+  --set gateway.resources.requests.cpu=500m \
+  --set gateway.resources.requests.memory=512Mi \
+  --set gateway.replicas=3
+```
+
+### Uninstall
+
+```bash
+helm delete higress -n higress-system
+```
+
+---
+
+## hgctl
+
+`hgctl` is a command-line tool for installing and managing Higress. It supports interactive profile selection for Kubernetes clusters, local kind clusters, and Docker environments.
+
+### Install hgctl
+
+Download the latest release from the [Higress releases page](https://github.com/alibaba/higress/releases) and place the binary in your `PATH`.
+
+### Install Higress using hgctl
+
+```bash
+hgctl install
+```
+
+Running `hgctl install` without flags opens an interactive prompt to select a profile:
+
+```
+Please select higress install configuration profile:
+
+1. Install higress to local kubernetes cluster like kind etc.
+2. Install higress to kubernetes cluster
+3. Install higress to local docker environment
+```
+
+You can also specify a profile directly using `--set`:
+
+<Tabs>
+  <Tab title="Kubernetes cluster">
+    ```bash
+    hgctl install --set profile=k8s
+    ```
+  </Tab>
+  <Tab title="Local Kubernetes (kind)">
+    ```bash
+    hgctl install --set profile=local-k8s
+    ```
+  </Tab>
+  <Tab title="Docker">
+    ```bash
+    hgctl install --set profile=local-docker \
+      --set gateway.httpPort=8080 \
+      --set gateway.httpsPort=8443
+    ```
+  </Tab>
+</Tabs>
+
+### Override profile values
+
+Use `--set` to override any profile setting:
+
+```bash
+# Override gateway replicas and enable Istio API
+hgctl install --set profile=k8s \
+  --set global.enableIstioAPI=true \
+  --set gateway.replicas=2
+```
+
+Use `--set values.<key>=<value>` to override Helm chart values directly:
+
+```bash
+hgctl install --set profile=local-k8s \
+  --set values.global.proxy.resources.requests.cpu=500m
+```
+
+### Use a custom values file
+
+```bash
+hgctl install --set profile=k8s --filename my-values.yaml
+```
+
+### Other hgctl commands
+
+| Command | Description |
+|---------|-------------|
+| `hgctl install` | Install Higress on a cluster or locally |
+| `hgctl upgrade` | Upgrade an existing Higress installation |
+| `hgctl uninstall` | Remove Higress from the cluster |
+| `hgctl profile` | List and describe available profiles |
+| `hgctl manifest` | Generate Higress manifests without applying them |
+| `hgctl dashboard` | Open the Higress console in a browser |
+| `hgctl plugin` | Manage Wasm plugins |
+| `hgctl config` | Inspect gateway xDS configuration (listeners, routes, endpoints, clusters) |
+| `hgctl version` | Print the hgctl version |
+| `hgctl completion` | Generate shell completion scripts |
+| `hgctl agent` | Run Higress as an AI agent |
+| `hgctl mcp` | MCP (Model Context Protocol) management commands |
+
+### Uninstall
+
+```bash
+hgctl uninstall
+```
+
+---
+
+## Verify the installation
+
+After installing via any method, verify that the gateway is accepting traffic:
+
+```bash
+curl -I http://localhost:8080
+```
+
+For Kubernetes deployments, check that all pods in `higress-system` are running:
+
+```bash
+kubectl get pods -n higress-system
+```
+
+You should see pods for `higress-controller`, `higress-gateway`, and `higress-console` all in `Running` state.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Core concepts" icon="book" href="/concepts/architecture">
+    Understand how the controller, gateway, and console work together.
+  </Card>
+  <Card title="AI gateway guide" icon="robot" href="/guides/ai-proxy">
+    Configure Higress as an AI gateway for LLM providers.
+  </Card>
+  <Card title="Ingress controller" icon="cloud" href="/guides/ingress-controller">
+    Use Higress as a Kubernetes ingress controller.
+  </Card>
+  <Card title="Helm deployment" icon="dharmachakra" href="/operations/helm-deployment">
+    Full Helm values reference and production deployment guidance.
+  </Card>
+</CardGroup>

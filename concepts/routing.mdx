@@ -1,0 +1,209 @@
+---
+title: "Routing"
+description: "How Higress routes traffic using Kubernetes Ingress, Gateway API, header and path matching, and service discovery from external registries."
+---
+
+Higress supports two standard Kubernetes routing APIs — the original **Ingress API** and the newer **Gateway API** — along with Higress-specific CRDs for connecting to external service registries and performing protocol translation. All routing configuration takes effect in milliseconds without reloading the proxy.
+
+---
+
+## Kubernetes Ingress API
+
+Higress functions as a full-featured Ingress controller and is **compatible with many annotations from the nginx-ingress controller**, simplifying migration from nginx-based setups.
+
+### Path and host routing
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example
+  annotations:
+    higress.io/exact-match-header-xxx: "foo"
+spec:
+  rules:
+  - host: example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: my-service
+            port:
+              number: 80
+```
+
+The annotation `higress.io/exact-match-header-xxx: "foo"` adds an exact header match condition on the header `xxx`, restricting the route to requests that carry that header value.
+
+### Ingress path types
+
+| `pathType` | Behavior |
+|---|---|
+| `Exact` | Matches the path exactly. |
+| `Prefix` | Matches any path that starts with the specified prefix. |
+| `ImplementationSpecific` | Behaviour defined by Higress; defaults to prefix matching. |
+
+<Note>
+  Compared to ingress-nginx, Higress significantly reduces resource overhead and improves the speed at which route changes take effect — up to ten times faster according to real-world migration reports from large-scale Kubernetes deployments.
+</Note>
+
+---
+
+## Gateway API
+
+Higress fully supports the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) and provides a smooth migration path from the Ingress API.
+
+### Supported resources
+
+<CardGroup cols={2}>
+  <Card title="GatewayClass" icon="layer-group">
+    Defines the controller implementation. Set `controllerName` to `higress.io/gateway-controller`.
+  </Card>
+  <Card title="Gateway" icon="door-open">
+    Declares listeners (ports, protocols, TLS). References a `GatewayClass`.
+  </Card>
+  <Card title="HTTPRoute" icon="route">
+    Attaches HTTP routing rules to a Gateway. Supports path, header, method, and query parameter matching.
+  </Card>
+  <Card title="GRPCRoute / TCPRoute" icon="network-wired">
+    Attaches gRPC and raw TCP routing rules. Useful for non-HTTP microservice traffic.
+  </Card>
+</CardGroup>
+
+### HTTPRoute example
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+spec:
+  parentRefs:
+  - name: my-gateway
+  hostnames:
+  - "api.example.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+      headers:
+      - name: X-Version
+        value: "2"
+    backendRefs:
+    - name: api-service-v2
+      port: 8080
+```
+
+---
+
+## Matching Rules
+
+Higress supports fine-grained traffic matching at multiple dimensions:
+
+| Dimension | Ingress API | Gateway API |
+|---|---|---|
+| Host | `spec.rules[].host` | `spec.hostnames[]` |
+| Path (prefix) | `pathType: Prefix` | `path.type: PathPrefix` |
+| Path (exact) | `pathType: Exact` | `path.type: Exact` |
+| HTTP method | Annotation | `HTTPRoute.spec.rules[].matches[].method` |
+| Request header | `higress.io/exact-match-header-*` annotation | `HTTPRoute.spec.rules[].matches[].headers[]` |
+| Query parameter | — | `HTTPRoute.spec.rules[].matches[].queryParams[]` |
+
+---
+
+## External Service Discovery (McpBridge)
+
+The `McpBridge` CRD lets Higress discover services registered in external service registries, converting them to Istio `ServiceEntry` resources that Envoy can route to. This is essential for microservice environments that pre-date Kubernetes or use multiple registries.
+
+### Supported registries
+
+<CardGroup cols={2}>
+  <Card title="Nacos" icon="circle-nodes">
+    Alibaba's service registry. Supports namespace, group, and access-key based authentication.
+  </Card>
+  <Card title="ZooKeeper" icon="circle-nodes">
+    Apache ZooKeeper. Services at configurable path prefixes are automatically discovered.
+  </Card>
+  <Card title="Consul" icon="circle-nodes">
+    HashiCorp Consul. Supports datacenter, namespace, and service-tag filtering.
+  </Card>
+  <Card title="Eureka" icon="circle-nodes">
+    Netflix Eureka. Discoverable via standard Eureka REST API.
+  </Card>
+</CardGroup>
+
+### McpBridge example
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: my-registries
+  namespace: higress-system
+spec:
+  registries:
+  - type: nacos2
+    name: production-nacos
+    domain: nacos.internal
+    port: 8848
+    nacosNamespaceId: "public"
+    nacosGroups:
+    - DEFAULT_GROUP
+  - type: consul
+    name: consul-dc1
+    domain: consul.internal
+    port: 8500
+    consulDatacenter: dc1
+```
+
+Once a McpBridge is applied, discovered services are addressable as `<service-name>.<namespace>.svc.cluster.local` inside Ingress and HTTPRoute backends.
+
+---
+
+## HTTP-to-RPC Protocol Translation (Http2Rpc)
+
+The `Http2Rpc` CRD enables HTTP clients to call **Dubbo** and **gRPC** backend services without any client-side changes. Higress performs the protocol translation at the gateway layer.
+
+### Dubbo example
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: Http2Rpc
+metadata:
+  name: user-service-rpc
+  namespace: higress-system
+spec:
+  dubbo:
+    service: com.example.UserService
+    version: "1.0.0"
+    group: ""
+    methods:
+    - serviceMethod: getUserById
+      httpPath: /user/{id}
+      httpMethods:
+      - GET
+      params:
+      - paramSource: PATH
+        paramKey: id
+        paramType: java.lang.Long
+```
+
+With this configuration, an HTTP `GET /user/123` request is transparently converted into a Dubbo invocation of `com.example.UserService#getUserById(123L)`.
+
+---
+
+## Zero-Reload Configuration Updates
+
+<Tip>
+  All routing changes — new routes, modified match conditions, updated backends — are delivered to Envoy via the xDS protocol. Envoy applies them live with no connection drops. This is in sharp contrast to Nginx-based controllers where a config reload can disrupt long-running connections.
+</Tip>
+
+The speed improvement comes from the xDS push pipeline:
+
+1. You apply or update an `Ingress`, `HTTPRoute`, `McpBridge`, or `Http2Rpc` resource.
+2. The relevant Higress Core controller detects the change immediately via a Kubernetes informer.
+3. Higress Core translates it to an Istio resource and pushes it to Discovery via MCP.
+4. Discovery recalculates the affected xDS structures and streams the delta to Envoy via gRPC.
+5. Envoy updates its routing table in-place — **no reload, no dropped connections**.

@@ -1,97 +1,90 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Higress — AI Native API Gateway"
+description: "A cloud-native AI Gateway and API Gateway built on Envoy and Istio. Proxy 40+ LLM providers, host MCP servers, manage Kubernetes ingress, and extend with Wasm plugins."
 ---
 
-## Setting up
+Higress is an open-source, cloud-native API gateway born inside Alibaba to serve large-scale production workloads. It combines a high-performance AI gateway with a full-featured Kubernetes ingress controller and a flexible Wasm plugin system — all built on Envoy and Istio.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Run Higress locally with a single Docker command in under five minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="server" href="/installation">
+    Deploy on Kubernetes with Helm or run standalone with Docker Compose.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="AI Gateway Guide" icon="brain" href="/guides/ai-proxy">
+    Proxy OpenAI, Claude, Qwen, and 40+ other LLM providers with a unified API.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Plugin Reference" icon="puzzle-piece" href="/plugins/overview">
+    Browse built-in plugins for AI, authentication, traffic control, and security.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Higress?
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="AI Gateway" icon="microchip">
+    Connect to all major LLM providers using a single OpenAI-compatible API. Built-in token rate limiting, multi-model load balancing, semantic caching, and AI observability.
+  </Card>
+  <Card title="MCP Server Hosting" icon="network-wired">
+    Host Model Context Protocol servers so AI agents can call your tools and services. Unified auth, rate limiting, audit logs, and observability for every tool call.
+  </Card>
+  <Card title="Kubernetes Ingress" icon="dharmachakra">
+    Drop-in replacement for nginx-ingress with 10× faster config propagation, Gateway API support, and significantly lower resource overhead.
+  </Card>
+  <Card title="Wasm Plugin System" icon="code">
+    Extend the gateway with sandboxed Wasm plugins written in Go, Rust, or JavaScript. Hot-reload plugin logic without dropping a single connection.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started in minutes
 
-## Need inspiration?
+<Steps>
+  <Step title="Start Higress with Docker">
+    The fastest way to run Higress locally is with a single `docker run` command:
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    ```bash
+    mkdir higress && cd higress
+    docker run -d --rm --name higress-ai \
+      -v ${PWD}:/data \
+      -p 8001:8001 -p 8080:8080 -p 8443:8443 \
+      higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest
+    ```
+
+    - **8001** — Higress UI console
+    - **8080** — Gateway HTTP entry
+    - **8443** — Gateway HTTPS entry
+  </Step>
+  <Step title="Open the console">
+    Navigate to `http://localhost:8001` to access the Higress UI console where you can configure routes, plugins, domains, and certificates.
+  </Step>
+  <Step title="Configure an AI route">
+    Add the `ai-proxy` plugin to a route and point it at your preferred LLM provider. Higress normalizes all providers to the OpenAI API format.
+
+    See the [AI Proxy Guide](/guides/ai-proxy) for a step-by-step walkthrough.
+  </Step>
+  <Step title="Extend with plugins">
+    Browse the [Plugin Reference](/plugins/overview) to add rate limiting, authentication, WAF protection, and more — no restarts required.
+  </Step>
+</Steps>
+
+## Core use cases
+
+<CardGroup cols={2}>
+  <Card title="AI Proxy" icon="wand-magic-sparkles" href="/plugins/ai-proxy">
+    Route requests across 40+ LLM providers with fallback, load balancing, and token-based rate limiting.
+  </Card>
+  <Card title="MCP Servers" icon="robot" href="/guides/mcp-server">
+    Host remote MCP servers for AI agents with enterprise-grade security and observability.
+  </Card>
+  <Card title="Security Gateway" icon="shield-halved" href="/guides/security">
+    WAF protection, key auth, JWT auth, OIDC, HMAC auth, and IP restriction out of the box.
+  </Card>
+  <Card title="Microservice Gateway" icon="sitemap" href="/guides/ingress-controller">
+    Service discovery from Nacos, ZooKeeper, Consul, and Eureka with deep Dubbo integration.
+  </Card>
+</CardGroup>
+
+<Note>
+  Higress is battle-tested at Alibaba scale — supporting hundreds of thousands of requests per second with 99.99% availability. It powers core AI applications including Tongyi Bailian and the Alibaba Cloud machine learning platform.
+</Note>

@@ -1,0 +1,379 @@
+---
+title: "Observability"
+description: "Monitor Higress with access logs, Prometheus metrics, distributed tracing, and AI-specific observability via the ai-statistics plugin."
+---
+
+Higress is built on Envoy and inherits its observability stack. Out of the box you get structured access logs, Prometheus metrics, and distributed tracing. The `ai-statistics` Wasm plugin adds AI-specific observability: token counting, first-token latency, model attribution, and full request/response logging.
+
+## Access logs
+
+Higress uses Envoy's access logging pipeline. Logs are emitted in JSON format and can include Envoy command operators, filter state values, and custom Wasm-injected fields.
+
+### Default log format
+
+The default access log includes standard HTTP fields: method, path, status code, upstream cluster, response time, and bytes transferred. To include AI statistics fields, extend the format with the `FILTER_STATE` operator:
+
+```yaml
+# Add to Higress Helm values or EnvoyFilter
+accessLog:
+  format: |
+    {
+      "start_time": "%START_TIME%",
+      "method": "%REQ(:METHOD)%",
+      "path": "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%",
+      "protocol": "%PROTOCOL%",
+      "response_code": "%RESPONSE_CODE%",
+      "duration": "%DURATION%",
+      "upstream_cluster": "%UPSTREAM_CLUSTER%",
+      "x_forwarded_for": "%REQ(X-FORWARDED-FOR)%",
+      "user_agent": "%REQ(USER-AGENT)%",
+      "request_id": "%REQ(X-REQUEST-ID)%",
+      "ai_log": "%FILTER_STATE(wasm.ai_log:PLAIN)%"
+    }
+```
+
+The `ai_log` field is populated by the `ai-statistics` plugin and contains a JSON string with AI-specific fields (see [AI statistics](#ai-statistics) below).
+
+### Per-field access log fields
+
+To output individual AI statistics fields as top-level log fields, enable `as_separate_log_field` in the plugin config and add the corresponding `FILTER_STATE` operator to the log format:
+
+```yaml
+# In access log format
+{
+  "ai_log": "%FILTER_STATE(wasm.ai_log:PLAIN)%",
+  "consumer": "%FILTER_STATE(wasm.consumer:PLAIN)%"
+}
+```
+
+## Metrics
+
+Higress exposes Prometheus metrics via the standard Envoy metrics endpoint. The `ai-statistics` plugin adds AI-specific counters using the naming convention `route_upstream_model_consumer_metric_*`.
+
+### AI metrics
+
+All AI metrics are labeled with `ai_route`, `ai_cluster`, `ai_model`, and `ai_consumer`:
+
+```
+# Cumulative input token count
+route_upstream_model_consumer_metric_input_token{
+  ai_route="ai-route-openai",
+  ai_cluster="outbound|443||openai.dns",
+  ai_model="gpt-4o",
+  ai_consumer="service-a"
+} 1240
+
+# Cumulative output token count
+route_upstream_model_consumer_metric_output_token{
+  ai_route="ai-route-openai",
+  ai_cluster="outbound|443||openai.dns",
+  ai_model="gpt-4o",
+  ai_consumer="service-a"
+} 3812
+
+# Cumulative total request duration (ms), both streaming and non-streaming
+route_upstream_model_consumer_metric_llm_service_duration{
+  ai_route="ai-route-openai",
+  ai_cluster="outbound|443||openai.dns",
+  ai_model="gpt-4o",
+  ai_consumer="service-a"
+} 94500
+
+# Cumulative request count
+route_upstream_model_consumer_metric_llm_duration_count{...} 42
+
+# Cumulative first-token latency (ms) for streaming requests
+route_upstream_model_consumer_metric_llm_first_token_duration{...} 8400
+
+# Cumulative streaming request count
+route_upstream_model_consumer_metric_llm_stream_duration_count{...} 18
+```
+
+### Useful PromQL queries
+
+**Average first-token latency (streaming):**
+
+```promql
+irate(route_upstream_model_consumer_metric_llm_first_token_duration[2m])
+/
+irate(route_upstream_model_consumer_metric_llm_stream_duration_count[2m])
+```
+
+**Average total request duration:**
+
+```promql
+irate(route_upstream_model_consumer_metric_llm_service_duration[2m])
+/
+irate(route_upstream_model_consumer_metric_llm_duration_count[2m])
+```
+
+**Token usage per model over last hour:**
+
+```promql
+increase(route_upstream_model_consumer_metric_input_token[1h])
+```
+
+## Tracing
+
+Higress supports distributed tracing via Envoy's built-in Zipkin, Jaeger, and OpenTelemetry exporters. The `ai-statistics` plugin enriches spans with AI-specific attributes using the OpenTelemetry Generative AI semantic conventions.
+
+### Span attributes added by ai-statistics
+
+| Attribute | Description |
+|---|---|
+| `gen_ai.span.kind` | Span kind identifier |
+| `gen_ai.model_name` | Model name from the response |
+| `gen_ai.request.model` | Model name from the request |
+| `gen_ai.usage.input_tokens` | Input token count |
+| `gen_ai.usage.output_tokens` | Output token count |
+| `gen_ai.usage.total_tokens` | Total token count |
+
+Configure the plugin to add custom attributes to spans using `apply_to_span: true`:
+
+```yaml
+attributes:
+- key: consumer
+  value_source: request_header
+  value: x-mse-consumer
+  apply_to_log: true
+  apply_to_span: true
+```
+
+## AI statistics
+
+The `ai-statistics` plugin provides comprehensive AI observability. It works alongside the `ai-proxy` plugin and is applied to the same route.
+
+### Plugin execution
+
+- Phase: `CUSTOM`
+- Priority: `200`
+
+### Basic configuration (zero config)
+
+With no configuration, the plugin automatically extracts and records:
+
+- `model` — Model name from the response
+- `input_token` — Input token count
+- `output_token` — Output token count
+- `llm_first_token_duration` — Time to first token for streaming requests (ms)
+- `llm_service_duration` — Total request duration (ms)
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-statistics
+  namespace: higress-system
+spec:
+  matchRules:
+  - config: {}
+    ingress:
+    - my-ai-route
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-statistics:1.0.0
+```
+
+The resulting `ai_log` field in access logs:
+
+```json
+{
+  "ai_log": "{\"model\":\"gpt-4o\",\"input_token\":\"24\",\"output_token\":\"83\",\"llm_first_token_duration\":\"312\",\"llm_service_duration\":\"2841\"}"
+}
+```
+
+### Recording questions and answers
+
+Use built-in attribute keys (`question`, `answer`) for zero-boilerplate Q&A logging:
+
+```yaml
+attributes:
+- key: question   # Built-in: auto-extracts last user message
+  apply_to_log: true
+- key: answer     # Built-in: auto-extracts answer (streaming and non-streaming)
+  apply_to_log: true
+```
+
+For multi-turn conversations with session tracking:
+
+```yaml
+session_id_header: "x-session-id"
+attributes:
+- key: messages
+  value_source: request_body
+  value: messages
+  apply_to_log: true
+- key: question
+  apply_to_log: true
+- key: answer
+  apply_to_log: true
+- key: reasoning    # Built-in: reasoning_content from DeepSeek-R1 and similar
+  apply_to_log: true
+- key: tool_calls   # Built-in: assembled tool calls (handles streaming fragmentation)
+  apply_to_log: true
+```
+
+When a session ID is present in the request, it appears in the log automatically:
+
+```json
+{
+  "ai_log": "{\"session_id\":\"sess_abc123\",\"model\":\"gpt-4o\",\"input_token\":\"10\",\"output_token\":\"69\",\"llm_first_token_duration\":\"309\",\"llm_service_duration\":\"1955\"}"
+}
+```
+
+### Built-in attributes reference
+
+| Key | Description | Works with |
+|---|---|---|
+| `question` | Last user message content | OpenAI and Claude protocols |
+| `answer` | AI response content | OpenAI and Claude, streaming and non-streaming |
+| `tool_calls` | Complete tool call list (assembles streaming fragments by index) | OpenAI and Claude |
+| `reasoning` | Reasoning process (`reasoning_content` field) | DeepSeek-R1 and other reasoning models |
+| `reasoning_tokens` | Number of reasoning tokens | OpenAI Chat Completions `output_token_details.reasoning_tokens` |
+| `cached_tokens` | Number of prompt-cached tokens | OpenAI Chat Completions `input_token_details.cached_tokens` |
+| `input_token_details` | Full input token details object | OpenAI, Gemini, Anthropic |
+| `output_token_details` | Full output token details object | OpenAI, Gemini, Anthropic |
+
+### Token detail logging
+
+Record detailed token breakdown for cost analysis and reasoning model monitoring:
+
+```yaml
+attributes:
+- key: reasoning_tokens
+  apply_to_log: true
+- key: cached_tokens
+  apply_to_log: true
+- key: input_token_details
+  apply_to_log: true
+- key: output_token_details
+  apply_to_log: true
+```
+
+Example log for a request using prompt caching and a reasoning model:
+
+```json
+{
+  "ai_log": "{\"model\":\"gpt-4o\",\"input_token\":\"100\",\"output_token\":\"50\",\"reasoning_tokens\":\"25\",\"cached_tokens\":\"80\",\"input_token_details\":\"{\\\"cached_tokens\\\":80}\",\"output_token_details\":\"{\\\"reasoning_tokens\\\":25}\",\"llm_service_duration\":\"2000\"}"
+}
+```
+
+### Consumer attribution
+
+When used alongside `key-auth` or `jwt-auth`, record which consumer made each request by reading the `X-Mse-Consumer` header injected by the authentication plugin:
+
+```yaml
+attributes:
+- key: consumer
+  value_source: request_header
+  value: x-mse-consumer
+  apply_to_log: true
+  as_separate_log_field: true
+```
+
+With `as_separate_log_field: true`, the consumer value is stored separately and can be included in the access log format:
+
+```
+"consumer": "%FILTER_STATE(wasm.consumer:PLAIN)%"
+```
+
+### Path and content type filtering
+
+By default, the plugin activates on paths matching standard AI API suffixes:
+
+- `/v1/chat/completions`
+- `/v1/completions`
+- `/v1/embeddings`
+- `/v1/models`
+- `/generateContent`
+- `/streamGenerateContent`
+
+And for content types `text/event-stream` and `application/json`.
+
+Override these defaults to restrict or expand coverage:
+
+```yaml
+# Only process specific paths
+enable_path_suffixes:
+- "/v1/chat/completions"
+- "/v1/embeddings"
+
+# Process all paths
+enable_path_suffixes:
+- "*"
+
+# Only buffer specific content types
+enable_content_types:
+- "text/event-stream"
+- "application/json"
+```
+
+### Custom attribute extraction
+
+Extract any value from request/response headers or body and record it in logs or spans:
+
+```yaml
+attributes:
+- key: model
+  value_source: request_body
+  value: model              # JSON path using gjson syntax
+  apply_to_log: true
+  apply_to_span: true
+
+- key: request_id
+  value_source: request_header
+  value: x-request-id
+  apply_to_log: true
+```
+
+For streaming responses, use `rule` to specify how to accumulate the value across chunks:
+
+| Rule | Behavior |
+|---|---|
+| `first` | Extract from the first valid SSE chunk |
+| `replace` | Extract from the last valid SSE chunk |
+| `append` | Concatenate values from all chunks |
+
+```yaml
+attributes:
+- key: answer
+  value_source: response_streaming_body
+  value: choices.0.delta.content
+  rule: append
+  apply_to_log: true
+```
+
+### Non-OpenAI protocol support
+
+When `ai-proxy` is configured with `protocol: original`, the response format differs from OpenAI. Disable the default usage parser and configure explicit extraction paths:
+
+```yaml
+disable_openai_usage: true
+attributes:
+- key: model
+  value_source: response_body
+  value: usage.models.0.model_id
+  apply_to_log: true
+- key: input_token
+  value_source: response_body
+  value: usage.models.0.input_tokens
+  apply_to_log: true
+- key: output_token
+  value_source: response_body
+  value: usage.models.0.output_tokens
+  apply_to_log: true
+```
+
+### Debugging
+
+Enable Higress debug logging to verify `ai_log` content during development:
+
+```bash
+# Log output example showing ai_log content
+2026/01/31 23:29:30 proxy_debug_log: [ai-statistics] [nil] [test-request-id] [ai_log] \
+  attributes to be written: {"question":"What is 2+2?","answer":"4","model":"gpt-4","input_token":20,"output_token":10}
+```
+
+This shows exactly what will be written to the access log, allowing you to verify extraction paths and field names before going to production.
+
+<Tip>
+The `value_length_limit` configuration option (default `4000`) controls the maximum character length of any single attribute value. Increase it if you need to log long prompts or responses.
+</Tip>

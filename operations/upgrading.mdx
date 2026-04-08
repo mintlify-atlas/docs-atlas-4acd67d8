@@ -1,0 +1,176 @@
+---
+title: "Upgrading"
+description: "Procedures for upgrading Higress using Helm or hgctl, with zero-downtime guidance and version checking."
+---
+
+Higress supports in-place upgrades through both Helm and the `hgctl` CLI tool. The current release is **v2.2.1**.
+
+## Checking the current version
+
+<Tabs>
+  <Tab title="hgctl">
+    Report both the client (hgctl) version and the server-side versions of the controller and gateway pods:
+
+    ```bash
+    hgctl version
+    ```
+
+    To output in JSON format:
+
+    ```bash
+    hgctl version --output=json
+    ```
+
+    To show only the client version without connecting to the cluster:
+
+    ```bash
+    hgctl version --client
+    ```
+
+    The command queries `app=higress-controller` pods for the controller version and `app=higress-gateway` pods for the Envoy version.
+  </Tab>
+  <Tab title="kubectl">
+    Check the image tags directly on the running deployments:
+
+    ```bash
+    kubectl get deploy -n higress-system \
+      higress-controller higress-gateway \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}{end}'
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Upgrading with Helm
+
+<Steps>
+  <Step title="Update the Helm repository">
+    Fetch the latest chart index before upgrading:
+
+    ```bash
+    helm repo update
+    ```
+  </Step>
+  <Step title="Review upcoming changes">
+    Do a dry run to see what Kubernetes resources will change without applying them:
+
+    ```bash
+    helm upgrade higress -n higress-system higress.io/higress \
+      --dry-run
+    ```
+  </Step>
+  <Step title="Upgrade">
+    Apply the upgrade:
+
+    ```bash
+    helm upgrade higress -n higress-system higress.io/higress
+    ```
+
+    To override specific values during the upgrade:
+
+    ```bash
+    helm upgrade higress -n higress-system higress.io/higress \
+      --set gateway.replicas=3
+    ```
+  </Step>
+  <Step title="Verify the rollout">
+    Wait for the rollout to complete and confirm all pods reach `Running` state:
+
+    ```bash
+    kubectl rollout status deployment/higress-controller -n higress-system
+    kubectl rollout status deployment/higress-gateway -n higress-system
+    kubectl get pods -n higress-system
+    ```
+  </Step>
+</Steps>
+
+<Note>
+Helm upgrades preserve any values you set during the original `helm install` only if you pass `--reuse-values`. Without it, Helm uses the chart defaults for any parameter you do not explicitly set on the `upgrade` command line.
+</Note>
+
+---
+
+## Upgrading with hgctl
+
+`hgctl upgrade` is an alias for `hgctl install` that performs additional pre-upgrade eligibility checks. It reads the stored installation profile from `~/.hgctl/profiles/` or from a ConfigMap in the cluster.
+
+<Steps>
+  <Step title="Run the upgrade command">
+    ```bash
+    hgctl upgrade
+    ```
+
+    `hgctl` will detect any previously installed profiles and prompt you to select one if multiple exist:
+
+    ```
+    ⌛️ Checking higress installed profiles...
+
+    Found a profile:: install mode: k8s, profile location: higress-system/higress-profile, version: v2.1.0
+
+    🧐 Validating Profile: "k8s"
+
+    All Higress resources will be upgrade from the cluster.
+    Proceed? (y/N)
+    ```
+  </Step>
+  <Step title="Override values if needed">
+    Pass `--set` flags to change configuration during the upgrade:
+
+    ```bash
+    hgctl upgrade --set gateway.replicas=2
+    ```
+
+    Or supply a custom values file:
+
+    ```bash
+    hgctl upgrade -f my-values.yaml
+    ```
+  </Step>
+  <Step title="Use development builds">
+    To upgrade to the latest pre-release version (alpha, beta, or release candidate):
+
+    ```bash
+    hgctl upgrade --devel
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Zero-downtime upgrade considerations
+
+<Accordion title="Gateway rolling update strategy">
+  By default, the gateway Deployment uses a rolling update strategy with:
+
+  - `rollingMaxSurge: 100%` — new pods are started before old ones are terminated
+  - `rollingMaxUnavailable: 25%` — at most 25% of pods are unavailable at any time
+
+  For strict zero-downtime requirements, ensure you have at least two gateway replicas (`gateway.replicas=2`) so that traffic is never fully interrupted during the rollout.
+
+  When `global.local` is `true` (local development clusters), `rollingMaxUnavailable` defaults to `100%`.
+</Accordion>
+
+<Accordion title="Controller upgrade">
+  The controller runs with `replicas: 1` by default. During a controller upgrade there is a brief period where no controller pod is running. This does not affect in-flight requests (the gateway continues to serve traffic with the last pushed configuration) but new configuration changes will not be propagated until the new controller pod is ready.
+
+  To eliminate this window, enable autoscaling or temporarily increase `controller.replicas` before upgrading.
+</Accordion>
+
+<Accordion title="Preserve custom ConfigMap settings">
+  The Helm upgrade does not overwrite the `higress-config` ConfigMap if you have made manual changes to it. However, if you manage the ConfigMap exclusively through Helm values (e.g. `--set tracing.enable=true`), always include those flags in subsequent upgrades or they will revert to defaults.
+</Accordion>
+
+<Accordion title="CRDs are kept across upgrades">
+  All Higress CRDs (`WasmPlugin`, `McpBridge`, `Http2Rpc`) are annotated with `helm.sh/resource-policy: keep`. They are not deleted or overwritten during a `helm upgrade` or `helm delete`. If a new version introduces CRD schema changes, apply the updated CRDs manually:
+
+  ```bash
+  kubectl apply -f https://higress.io/helm-charts/crds.yaml
+  ```
+</Accordion>
+
+---
+
+## Release notes and changelogs
+
+Release notes for each version are published on the [Higress GitHub releases page](https://github.com/alibaba/higress/releases). Before upgrading across a major version boundary, review the migration guide in the release notes for breaking changes to CRD schemas or Helm values.

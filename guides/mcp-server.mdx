@@ -1,0 +1,287 @@
+---
+title: "MCP Server"
+description: "Host Model Context Protocol (MCP) servers through Higress and expose AI tools to agents via a unified endpoint."
+---
+
+Model Context Protocol (MCP) is a standard that lets AI agents discover and call tools over HTTP using JSON-RPC 2.0. Higress supports hosting MCP servers as Wasm plugins and routing MCP tool calls across multiple backend servers through a unified endpoint.
+
+## Architecture
+
+```
+AI Agent
+    │
+    │  tools/list, tools/call (JSON-RPC over HTTP)
+    ▼
+Higress Gateway
+    ├── mcp-server plugin  (embedded tool implementations)
+    └── mcp-router plugin  (routes to external MCP servers)
+         ├── /mcp-servers/server-a  →  Backend A
+         └── /mcp-servers/server-b  →  Backend B
+```
+
+Higress can operate in two complementary modes:
+
+- **Embedded mode** — The `mcp-server` Wasm plugin hosts tool implementations directly inside the gateway. Tools are implemented in Go and compiled into the plugin binary.
+- **Router mode** — The `mcp-router` plugin acts as a transparent proxy that forwards `tools/call` requests to the correct backend MCP server based on a server name prefix in the tool name.
+
+## Configuring the mcp-server plugin
+
+The `mcp-server` plugin registers named MCP servers, each with their own set of tools. The built-in distribution includes servers such as `quark-search` (web search) and `amap-tools` (mapping tools).
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: mcp-server
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      server:
+        name: quark-search
+      enable: true
+    ingress:
+    - mcp-endpoint
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/mcp-server:1.0.0
+```
+
+An AI agent can then list available tools with:
+
+```bash
+curl http://your-gateway.example.com/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+And invoke a tool with:
+
+```bash
+curl http://your-gateway.example.com/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "web_search",
+      "arguments": {
+        "query": "Higress AI gateway"
+      }
+    }
+  }'
+```
+
+## Configuring the mcp-router plugin
+
+The `mcp-router` plugin enables a single MCP endpoint to aggregate tools from multiple independent backend MCP servers. Tool names in `tools/call` requests are expected to be prefixed with the server name using the format `server-name/tool-name`.
+
+### Configuration fields
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `servers` | array | Yes | Routing table entries for backend MCP servers |
+| `servers[].name` | string | Yes | Server identifier matching the prefix in tool calls |
+| `servers[].domain` | string | No | Backend `:authority` header value. If omitted, the original domain is kept. |
+| `servers[].path` | string | Yes | Backend path to route the request to |
+
+### Example configuration
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: mcp-router
+  namespace: higress-system
+spec:
+  defaultConfig:
+    servers:
+    - name: rest-amap-server
+      domain: mcp.example.com
+      path: /mcp-servers/mcp-rest-amap-server
+    - name: random-user-server
+      domain: mcp.example.com
+      path: /mcp-servers/mcp-random-user-server
+  matchRules:
+  - config:
+      enable: true
+    ingress:
+    - mcp-endpoint
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/mcp-router:1.0.0
+```
+
+### How routing works
+
+When a `tools/call` request arrives with a prefixed tool name, the router:
+
+1. Extracts the server name and actual tool name from `server-name/tool-name`.
+2. Looks up the routing config for that server name.
+3. Replaces the `:authority` header with the configured `domain`.
+4. Replaces the `:path` header with the configured `path`.
+5. Rewrites the `params.name` field in the request body to just `tool-name` (prefix removed).
+6. Forwards the modified request.
+
+**Original request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "rest-amap-server/get-weather",
+    "arguments": {
+      "location": "New York"
+    }
+  }
+}
+```
+
+**Forwarded to backend as:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "get-weather",
+    "arguments": {
+      "location": "New York"
+    }
+  }
+}
+```
+
+<Note>
+If a tool name does not contain the `server-name/` prefix, the router passes the request through without modification. This allows mixing embedded and routed tools on the same endpoint.
+</Note>
+
+## Authentication for MCP endpoints
+
+Protect your MCP endpoint with API key authentication using the `key-auth` plugin. Apply it to the same Ingress that hosts the MCP endpoint:
+
+```yaml
+# Instance-level consumer configuration
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: key-auth-mcp
+  namespace: higress-system
+spec:
+  defaultConfig:
+    consumers:
+    - name: agent-1
+      credential: "mcp-key-abc123"
+    - name: agent-2
+      credential: "mcp-key-def456"
+    keys:
+    - x-api-key
+    - apikey
+    global_auth: false
+  matchRules:
+  - config:
+      allow:
+      - agent-1
+      - agent-2
+    ingress:
+    - mcp-endpoint
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/key-auth:1.0.0
+```
+
+Agents include their key in the request header:
+
+```bash
+curl http://your-gateway.example.com/mcp \
+  -H "x-api-key: mcp-key-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+## Rate limiting MCP endpoints
+
+Apply the `cluster-key-rate-limit` plugin to prevent individual agents from overloading the MCP endpoint. The plugin can key rate limits on the consumer name injected by authentication plugins via the `X-Mse-Consumer` header:
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: rate-limit-mcp
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      limit_by_header: X-Mse-Consumer
+      limit_keys:
+      - key: agent-1
+        query_per_second: 10
+      - key: agent-2
+        query_per_minute: 100
+    ingress:
+    - mcp-endpoint
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/cluster-key-rate-limit:1.0.0
+```
+
+## Monitoring MCP usage
+
+Enable the `ai-statistics` plugin on the MCP route to capture per-tool observability data. Because MCP tool calls are not LLM completions, disable the default OpenAI usage parsing:
+
+```yaml
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: mcp-stats
+  namespace: higress-system
+spec:
+  matchRules:
+  - config:
+      disable_openai_usage: true
+      enable_path_suffixes:
+        - "*"
+      attributes:
+      - key: consumer
+        value_source: request_header
+        value: x-mse-consumer
+        apply_to_log: true
+      - key: tool_name
+        value_source: request_body
+        value: params.name
+        apply_to_log: true
+    ingress:
+    - mcp-endpoint
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-statistics:1.0.0
+```
+
+Log entries will contain the consumer identity and the name of the tool that was called.
+
+## Converting OpenAPI specs to MCP
+
+The [openapi-to-mcp](https://github.com/higress-group/openapi-to-mcpserver) tool converts any OpenAPI 3.x specification into a remote MCP server that Higress can host. This lets you expose existing REST APIs as MCP tools without writing any code.
+
+<Steps>
+  <Step title="Install the tool">
+    ```bash
+    go install github.com/higress-group/openapi-to-mcpserver/cmd/openapi-to-mcp@latest
+    ```
+  </Step>
+  <Step title="Convert your OpenAPI spec">
+    ```bash
+    openapi-to-mcp --input ./your-api-spec.yaml --output ./mcp-server-config.yaml
+    ```
+  </Step>
+  <Step title="Deploy the generated configuration">
+    Apply the generated Higress WasmPlugin and route configuration to expose your API as an MCP server. The generated config includes tool definitions for each API operation, with parameter schemas extracted from the OpenAPI spec.
+  </Step>
+  <Step title="Test with an MCP client">
+    ```bash
+    curl http://your-gateway.example.com/mcp \
+      -H "Content-Type: application/json" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+    ```
+
+    The response will list all tools derived from your OpenAPI operations.
+  </Step>
+</Steps>
+
+<Tip>
+You can try Higress-hosted remote MCP servers at [https://mcp.higress.ai/](https://mcp.higress.ai/) to see the platform in action before deploying your own.
+</Tip>

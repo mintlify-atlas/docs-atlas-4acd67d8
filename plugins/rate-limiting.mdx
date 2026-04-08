@@ -1,0 +1,308 @@
+---
+title: "Rate Limiting"
+description: "Enforce cluster-wide rate limits on requests using Redis, keyed by consumer, IP, header, query parameter, or cookie."
+---
+
+The `cluster-key-rate-limit` plugin implements cluster-level rate limiting backed by Redis. Unlike single-instance rate limiting, it enforces consistent thresholds across all Higress gateway replicas, making it suitable for production multi-instance deployments.
+
+**Execution phase:** Default Phase  
+**Execution priority:** `20`
+
+The plugin supports two modes:
+
+- **Global threshold**: Apply a single rate limit to an entire rule group.
+- **Key-level limiting**: Group requests by a dynamic key extracted from the request (consumer name, IP address, header value, query parameter, or cookie value) and apply per-key limits.
+
+## Configuration
+
+### Top-level fields
+
+<ParamField path="rule_name" type="string" required>
+  Name of the rate limiting rule. Used to construct the Redis key in the format `rule_name:rate_limit_type:key_name:key_value`. Must be unique per route or instance to avoid key collisions across rules.
+</ParamField>
+
+<ParamField path="global_threshold" type="object">
+  Apply a single rate limit to all requests matched by this rule. Choose either `global_threshold` or `rule_items`, not both.
+</ParamField>
+
+<ParamField path="rule_items" type="object[]">
+  List of rate limiting rules. Rules are evaluated in array order; the first matching rule is applied and subsequent rules are ignored. Choose either `rule_items` or `global_threshold`, not both.
+</ParamField>
+
+<ParamField path="redis" type="object" required>
+  Redis connection configuration. See [Redis fields](#redis-fields) below.
+</ParamField>
+
+<ParamField path="show_limit_quota_header" type="boolean">
+  Include `X-RateLimit-Limit` (total allowed requests) and `X-RateLimit-Remaining` (remaining allowed requests) in the response headers.
+
+  Default: `false`
+</ParamField>
+
+<ParamField path="rejected_code" type="integer">
+  HTTP status code returned when a request is rate-limited.
+
+  Default: `429`
+</ParamField>
+
+<ParamField path="rejected_msg" type="string">
+  Response body returned when a request is rate-limited.
+
+  Default: `Too many requests`
+</ParamField>
+
+### `global_threshold` fields
+
+Choose exactly one time window:
+
+<ParamField path="query_per_second" type="integer">
+  Maximum number of requests allowed per second for the entire rule group.
+</ParamField>
+
+<ParamField path="query_per_minute" type="integer">
+  Maximum number of requests allowed per minute for the entire rule group.
+</ParamField>
+
+<ParamField path="query_per_hour" type="integer">
+  Maximum number of requests allowed per hour for the entire rule group.
+</ParamField>
+
+<ParamField path="query_per_day" type="integer">
+  Maximum number of requests allowed per day for the entire rule group.
+</ParamField>
+
+### `rule_items` entry fields
+
+Each entry must specify exactly one `limit_by_*` field and a `limit_keys` list.
+
+<ParamField path="limit_by_header" type="string">
+  HTTP request header name whose value is used as the rate limiting key. All requests with the same header value share a single counter.
+</ParamField>
+
+<ParamField path="limit_by_param" type="string">
+  URL query parameter name whose value is used as the rate limiting key. All requests with the same parameter value share a single counter.
+</ParamField>
+
+<ParamField path="limit_by_consumer" type="string">
+  Rate limit based on the authenticated consumer name (from the `X-Mse-Consumer` header). Set to an empty string `''`; no specific value is needed.
+</ParamField>
+
+<ParamField path="limit_by_cookie" type="string">
+  Cookie key name whose value is used as the rate limiting key.
+</ParamField>
+
+<ParamField path="limit_by_per_header" type="string">
+  HTTP request header name. Unlike `limit_by_header`, each distinct header value gets its own counter. Supports regex patterns (prefixed with `regexp:`) and wildcard `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_by_per_param" type="string">
+  URL query parameter name. Each distinct parameter value gets its own counter. Supports regex patterns (prefixed with `regexp:`) and wildcard `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_by_per_consumer" type="string">
+  Each distinct consumer gets its own counter. Supports regex patterns (prefixed with `regexp:`) and wildcard `*` in `limit_keys`. Set to an empty string `''`.
+</ParamField>
+
+<ParamField path="limit_by_per_cookie" type="string">
+  Cookie key name. Each distinct cookie value gets its own counter. Supports regex patterns (prefixed with `regexp:`) and wildcard `*` in `limit_keys`.
+</ParamField>
+
+<ParamField path="limit_by_per_ip" type="string">
+  Extract the client IP and apply a per-IP counter. Use `from-header-<header_name>` to extract from a header (e.g., `from-header-x-forwarded-for`), or `from-remote-addr` to use the direct peer socket IP.
+</ParamField>
+
+<ParamField path="limit_keys" type="object[]" required>
+  List of key-to-threshold mappings. Each entry specifies a `key` value (or pattern) and one time-window threshold.
+</ParamField>
+
+### `limit_keys` entry fields
+
+<ParamField path="key" type="string" required>
+  The key value to match. For `limit_by_per_*` types, supports:
+  - Exact string values
+  - Regular expressions prefixed with `regexp:` (e.g., `regexp:^user-.*`)
+  - Wildcard `*` to match all remaining requests
+
+  For `limit_by_per_ip`, supports exact IP addresses or CIDR blocks (e.g., `10.0.0.0/8`).
+</ParamField>
+
+<ParamField path="query_per_second" type="integer">
+  Maximum requests per second for this key.
+</ParamField>
+
+<ParamField path="query_per_minute" type="integer">
+  Maximum requests per minute for this key.
+</ParamField>
+
+<ParamField path="query_per_hour" type="integer">
+  Maximum requests per hour for this key.
+</ParamField>
+
+<ParamField path="query_per_day" type="integer">
+  Maximum requests per day for this key.
+</ParamField>
+
+### Redis fields
+
+<ParamField path="service_name" type="string" required>
+  Fully qualified domain name (FQDN) of the Redis service, including the service type suffix. Examples: `my-redis.dns`, `redis.my-ns.svc.cluster.local`.
+</ParamField>
+
+<ParamField path="service_port" type="integer">
+  Port of the Redis service.
+
+  Default: `80` for static services, `6379` for all other service types.
+</ParamField>
+
+<ParamField path="username" type="string">
+  Redis username for authentication.
+</ParamField>
+
+<ParamField path="password" type="string">
+  Redis password for authentication.
+</ParamField>
+
+<ParamField path="timeout" type="integer">
+  Redis connection timeout in milliseconds.
+
+  Default: `1000`
+</ParamField>
+
+<ParamField path="database" type="integer">
+  Redis database index to use. For example, `1` executes `SELECT 1`.
+
+  Default: `0`
+</ParamField>
+
+## Examples
+
+### Global rate limit for a rule group
+
+Limit all requests matching this rule to 1000 per minute, shared across all gateway instances:
+
+```yaml
+rule_name: route-a-global-limit
+global_threshold:
+  query_per_minute: 1000
+redis:
+  service_name: redis.static
+show_limit_quota_header: true
+```
+
+### Rate limit by API key query parameter
+
+Apply different limits to specific API keys, with a catch-all for unrecognized keys:
+
+```yaml
+rule_name: route-a-apikey-limit
+rule_items:
+  - limit_by_per_param: apikey
+    limit_keys:
+      # Requests starting with "a" — 10 per second per apikey
+      - key: "regexp:^a.*"
+        query_per_second: 10
+      # Requests starting with "b" — 100 per minute per apikey
+      - key: "regexp:^b.*"
+        query_per_minute: 100
+      # All other apikeys — 1000 per hour per apikey
+      - key: "*"
+        query_per_hour: 1000
+redis:
+  service_name: redis.static
+show_limit_quota_header: true
+```
+
+### Rate limit by request header
+
+```yaml
+rule_name: route-a-header-limit
+rule_items:
+  - limit_by_header: x-ca-key
+    limit_keys:
+      - key: "102234"
+        query_per_minute: 10
+      - key: "308239"
+        query_per_hour: 10
+redis:
+  service_name: redis.static
+```
+
+### Rate limit by client IP
+
+Extract client IP from `X-Forwarded-For` with different limits per IP range:
+
+```yaml
+rule_name: route-a-ip-limit
+rule_items:
+  - limit_by_per_ip: from-header-x-forwarded-for
+    limit_keys:
+      # Specific IP — 10 per day
+      - key: 1.1.1.1
+        query_per_day: 10
+      # /24 subnet — 100 per day per IP
+      - key: 1.1.1.0/24
+        query_per_day: 100
+      # All other IPs — 1000 per day per IP
+      - key: 0.0.0.0/0
+        query_per_day: 1000
+redis:
+  service_name: redis.static
+show_limit_quota_header: true
+```
+
+### Rate limit by authenticated consumer
+
+Requires a prior authentication plugin (such as `key-auth` or `jwt-auth`) that sets `X-Mse-Consumer`:
+
+```yaml
+rule_name: route-a-consumer-limit
+rule_items:
+  - limit_by_per_consumer: ''
+    limit_keys:
+      - key: "regexp:^a.*"
+        query_per_second: 10
+      - key: "regexp:^b.*"
+        query_per_minute: 100
+      - key: "*"
+        query_per_hour: 1000
+redis:
+  service_name: redis.static
+show_limit_quota_header: true
+```
+
+### Rate limit by cookie value
+
+```yaml
+rule_name: route-a-cookie-limit
+rule_items:
+  - limit_by_per_cookie: session_tier
+    limit_keys:
+      - key: "regexp:^a.*"
+        query_per_second: 10
+      - key: "regexp:^b.*"
+        query_per_minute: 100
+      - key: "*"
+        query_per_hour: 1000
+rejected_code: 200
+rejected_msg: '{"code":-1,"msg":"Too many requests"}'
+redis:
+  service_name: redis.static
+show_limit_quota_header: true
+```
+
+<Tip>
+Use `rejected_code: 200` with a JSON `rejected_msg` when your client application expects a 200 response with an error payload rather than a standard HTTP 429 status.
+</Tip>
+
+## Response headers
+
+When `show_limit_quota_header: true`, the following headers are included in responses:
+
+| Header | Description |
+|---|---|
+| `X-RateLimit-Limit` | Total number of requests allowed in the current window. |
+| `X-RateLimit-Remaining` | Number of requests remaining in the current window. |
+
+<Note>
+This plugin requires a Redis instance accessible from the Higress gateway. The `service_name` must resolve to a valid service registered in the gateway's service discovery.
+</Note>

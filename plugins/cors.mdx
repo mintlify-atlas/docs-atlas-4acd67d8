@@ -1,0 +1,227 @@
+---
+title: "CORS"
+description: "Configure Cross-Origin Resource Sharing (CORS) headers to control which origins, methods, and headers are allowed in cross-origin requests."
+---
+
+The `cors` plugin adds CORS (Cross-Origin Resource Sharing) HTTP response headers to control how browsers handle cross-origin requests to your API. It handles both simple requests and preflight (`OPTIONS`) requests.
+
+**Execution phase:** Authorization Phase  
+**Execution priority:** `340`
+
+<Warning>
+Illegal CORS requests — those with an origin, method, or header not in the configured allow lists — return HTTP `403` with the body `Invalid CORS request`.
+</Warning>
+
+## Configuration
+
+<ParamField path="allow_origins" type="string[]">
+  List of allowed origins for cross-origin access. Each origin must use the format `scheme://host:port`, for example `http://example.com:8081`.
+
+  Use `*` to allow all origins. When `allow_credentials` is `true`, `*` cannot be used here — use `allow_origin_patterns` instead.
+
+  Default: `["*"]`
+</ParamField>
+
+<ParamField path="allow_origin_patterns" type="string[]">
+  List of patterns for matching allowed origins. Use `*` as a wildcard to match subdomains or ports:
+
+  - `http://*.example.com` — matches any subdomain of `example.com` on the default port
+  - `http://*.example.com:[8080,9090]` — matches subdomains on specific ports
+  - `http://*.example.com:[*]` — matches subdomains on any port
+  - `*` — matches all domains and ports
+
+  `allow_origins` is checked first, then `allow_origin_patterns`. Both can be configured simultaneously.
+</ParamField>
+
+<ParamField path="allow_methods" type="string[]">
+  List of HTTP methods allowed in cross-origin requests. Use `*` to allow all methods.
+
+  Default: `["GET", "PUT", "POST", "DELETE", "PATCH", "OPTIONS"]`
+</ParamField>
+
+<ParamField path="allow_headers" type="string[]">
+  List of request headers the client is allowed to include in cross-origin requests that are not part of the CORS specification. Use `*` to allow any header.
+
+  Default: `["DNT", "X-CustomHeader", "Keep-Alive", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Authorization"]`
+</ParamField>
+
+<ParamField path="expose_headers" type="string[]">
+  List of response headers the browser is allowed to expose to the requesting page. These are headers not in the CORS safe list. Use `*` to expose all headers.
+
+  Default: none
+</ParamField>
+
+<ParamField path="allow_credentials" type="boolean">
+  Whether to allow the client to send credentials (such as cookies, HTTP authentication, or client-side certificates) in cross-origin requests.
+
+  When `true`, `allow_origins: ["*"]` is not permitted. Use `allow_origin_patterns` with `*` instead.
+
+  Default: `false`
+</ParamField>
+
+<ParamField path="max_age" type="number">
+  How long (in seconds) browsers may cache the results of a preflight request. During this time, the browser reuses the cached preflight result without sending another `OPTIONS` request.
+
+  Default: `86400` (24 hours)
+</ParamField>
+
+## Examples
+
+### Allow all origins without credentials
+
+Open CORS for all origins, methods, and headers. Suitable for public APIs that do not use session cookies.
+
+```yaml
+allow_origins:
+  - '*'
+allow_methods:
+  - '*'
+allow_headers:
+  - '*'
+expose_headers:
+  - '*'
+allow_credentials: false
+max_age: 7200
+```
+
+### Allow all origins with credentials
+
+When credentials must be supported, `allow_origin_patterns` with `*` is required because `allow_credentials: true` is incompatible with `allow_origins: ["*"]`.
+
+```yaml
+allow_origin_patterns:
+  - '*'
+allow_methods:
+  - '*'
+allow_headers:
+  - '*'
+expose_headers:
+  - '*'
+allow_credentials: true
+max_age: 7200
+```
+
+<Warning>
+`allow_credentials: true` is a sensitive setting. Enabling it allows cookies and authentication tokens to be sent in cross-origin requests. Use specific origin patterns rather than wildcards when possible.
+</Warning>
+
+### Restrict to specific subdomains and methods
+
+Allow only specific subdomains, HTTP methods, and request headers, while permitting credential forwarding:
+
+```yaml
+allow_origin_patterns:
+  - http://*.example.com
+  - http://*.example.org:[8080,9090]
+allow_methods:
+  - GET
+  - PUT
+  - POST
+  - DELETE
+allow_headers:
+  - Token
+  - Content-Type
+  - Authorization
+expose_headers:
+  - '*'
+allow_credentials: true
+max_age: 7200
+```
+
+With this configuration:
+- `http://app.example.com` — allowed (matches `http://*.example.com`)
+- `http://api.example.org:8080` — allowed (matches `http://*.example.org:[8080,9090]`)
+- `http://other.io` — blocked with `403 Invalid CORS request`
+
+### Mixed exact origins and patterns
+
+`allow_origins` and `allow_origin_patterns` can be used together. The plugin checks `allow_origins` first, then `allow_origin_patterns`.
+
+```yaml
+allow_origins:
+  - http://trusted.example.net
+allow_origin_patterns:
+  - http://*.example.com:[*]
+  - http://*.example.org:[9090,8080]
+allow_methods:
+  - GET
+  - POST
+  - PATCH
+allow_headers:
+  - Content-Type
+  - Token
+  - Authorization
+expose_headers:
+  - X-Custom-Header
+  - X-Env-UTM
+allow_credentials: true
+max_age: 3600
+```
+
+## CORS response headers
+
+The plugin sets the following response headers based on configuration:
+
+| Response header | Set on | Description |
+|---|---|---|
+| `Access-Control-Allow-Origin` | All requests | The matched origin, or `*` if credentials are not required. |
+| `Access-Control-Allow-Methods` | Preflight (`OPTIONS`) | Allowed HTTP methods. |
+| `Access-Control-Allow-Headers` | Preflight (`OPTIONS`) | Allowed request headers. |
+| `Access-Control-Expose-Headers` | All requests | Response headers the browser may expose. |
+| `Access-Control-Allow-Credentials` | All requests (when `allow_credentials: true`) | Indicates credentials are allowed. |
+| `Access-Control-Max-Age` | Preflight (`OPTIONS`) | Preflight cache duration in seconds. |
+
+## Testing
+
+### Simple request
+
+```bash
+curl -v \
+  -H "Origin: http://app.example.com" \
+  -H "Host: api.example.com" \
+  http://127.0.0.1/api/resource
+```
+
+Expected response headers:
+
+```
+access-control-allow-origin: http://app.example.com
+access-control-allow-credentials: true
+access-control-expose-headers: X-Custom-Header
+```
+
+### Preflight request
+
+```bash
+curl -v -X OPTIONS \
+  -H "Origin: http://app.example.com" \
+  -H "Host: api.example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: Content-Type, Authorization" \
+  http://127.0.0.1/api/resource
+```
+
+Expected response headers:
+
+```
+HTTP/1.1 200 OK
+access-control-allow-origin: http://app.example.com
+access-control-allow-methods: GET,POST,PATCH
+access-control-allow-headers: Content-Type,Authorization
+access-control-allow-credentials: true
+access-control-max-age: 3600
+```
+
+### Blocked origin
+
+```bash
+curl -v -X OPTIONS \
+  -H "Origin: http://untrusted.io" \
+  -H "Access-Control-Request-Method: GET" \
+  http://127.0.0.1/api/resource
+```
+
+```
+HTTP/1.1 403 Forbidden
+Invalid CORS request
+```

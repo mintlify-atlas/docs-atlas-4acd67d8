@@ -1,0 +1,333 @@
+---
+title: "Configuration"
+description: "Reference for Higress runtime configuration: the higress-config ConfigMap, WasmPlugin CRD, and McpBridge CRD."
+---
+
+Higress runtime behaviour is controlled by three primary mechanisms: the `higress-config` ConfigMap in the `higress-system` namespace, the `WasmPlugin` CRD for plugin management, and the `McpBridge` CRD for external service registry integration.
+
+## higress-config ConfigMap
+
+The `higress-config` ConfigMap is the central configuration object for the Higress controller. It lives in the `higress-system` namespace and is watched by `ConfigmapMgr`, which translates its settings into Envoy filters and mesh configuration.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: higress-config
+  namespace: higress-system
+data:
+  mesh: |-
+    accessLogEncoding: TEXT
+    configSources:
+    - address: xds://127.0.0.1:15051
+    - address: k8s://
+  meshNetworks: "networks: {}"
+```
+
+### `mesh` section
+
+The `mesh` key contains an inline YAML string that is parsed as an Istio MeshConfig object.
+
+#### `accessLogEncoding`
+
+Controls the format of Envoy access logs. Accepted values:
+
+| Value  | Description                                      |
+|--------|--------------------------------------------------|
+| `TEXT` | Human-readable, one log line per request (default) |
+| `JSON` | Structured JSON — easier to ingest with log aggregators |
+
+#### `configSources`
+
+Defines the ordered list of configuration sources that Istio Discovery (Pilot) reads from.
+
+| Address               | Description                                                        |
+|-----------------------|--------------------------------------------------------------------|
+| `xds://127.0.0.1:15051` | Higress Core MCP-over-xDS server (routes, virtual services, etc.) |
+| `k8s://`              | Kubernetes CRD store (Gateway API, Istio CRDs)                    |
+
+<Note>
+Both sources are required for standard deployments. Removing `xds://127.0.0.1:15051` will prevent Higress Core from pushing configuration to the data plane.
+</Note>
+
+#### `tracing`
+
+Distributed tracing is configured under the `higress` key of the ConfigMap. The `higress-config` ConfigMap also supports a top-level `tracing` section in the Helm chart:
+
+```yaml
+tracing:
+  enable: false
+  sampling: 100   # percentage, 0–100
+  timeout: 500    # milliseconds
+  # skywalking:
+  #   service: ""
+  #   port: 11800
+  # zipkin:
+  #   service: ""
+  #   port: 9411
+```
+
+Set `enable: true` and configure one of `skywalking` or `zipkin` to activate trace export.
+
+#### `gzip`
+
+Response compression is enabled by default. The settings come from the `gzip` top-level key in Helm values and are converted into an Envoy `compressor` filter by the controller.
+
+```yaml
+gzip:
+  enable: true
+  minContentLength: 1024          # bytes — do not compress smaller responses
+  contentType:
+    - "text/html"
+    - "text/css"
+    - "text/plain"
+    - "text/xml"
+    - "application/json"
+    - "application/javascript"
+    - "application/xhtml+xml"
+    - "image/svg+xml"
+  disableOnEtagHeader: true
+  memoryLevel: 5
+  windowBits: 12
+  chunkSize: 4096
+  compressionLevel: "BEST_COMPRESSION"
+  compressionStrategy: "DEFAULT_STRATEGY"
+```
+
+### `mcpServer.redis` — MCP Server session storage
+
+The MCP server uses Redis to persist session state. Configure it in the `higress` key of the ConfigMap:
+
+```yaml
+data:
+  higress: |-
+    mcpServer:
+      redis:
+        address: "redis:6379"
+        username: ""
+        password: ""
+        db: 0
+```
+
+<Warning>
+Avoid storing Redis credentials as plaintext in the ConfigMap. Use `passwordSecret` to reference a Kubernetes Secret instead.
+</Warning>
+
+To reference a Secret for the password:
+
+```yaml
+data:
+  higress: |-
+    mcpServer:
+      redis:
+        address: "redis:6379"
+        passwordSecret:
+          name: redis-credentials
+          key: password
+```
+
+The Secret must exist in the `higress-system` namespace:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-credentials
+  namespace: higress-system
+type: Opaque
+stringData:
+  password: "your-redis-password"
+```
+
+---
+
+## WasmPlugin CRD
+
+`WasmPlugin` (`extensions.higress.io/v1alpha1`) extends the Istio WasmPlugin with support for fine-grained scope matching. The Higress controller's `WasmPlugin Controller` translates it into an Istio WasmPlugin at runtime.
+
+### Scopes
+
+Plugins can be applied at four scopes via the `matchRules` field:
+
+| Scope    | Field in `matchRules` | Example value          |
+|----------|-----------------------|------------------------|
+| Global   | _(no `matchRules`)_   | n/a                    |
+| Domain   | `domain`              | `["example.com"]`      |
+| Route    | `ingress`             | `["default/my-ingress"]` |
+| Service  | `service`             | `["my-service.svc.cluster.local:8080"]` |
+
+### Key fields
+
+| Field                | Type    | Description                                                          |
+|----------------------|---------|----------------------------------------------------------------------|
+| `url`                | string  | OCI image or HTTP URL of the Wasm module                            |
+| `pluginName`         | string  | Plugin identifier used for ordering and referencing                  |
+| `defaultConfig`      | object  | Configuration applied when no `matchRules` entry matches            |
+| `defaultConfigDisable` | bool  | Disables the plugin globally when no rule matches                   |
+| `matchRules`         | array   | List of scope-specific config overrides                              |
+| `phase`              | enum    | Filter chain phase: `AUTHN`, `AUTHZ`, `STATS`, or `UNSPECIFIED_PHASE` |
+| `priority`           | integer | Ordering within the same `phase`                                     |
+| `failStrategy`       | enum    | `FAIL_CLOSE` (default) or `FAIL_OPEN` on fatal plugin errors        |
+| `imagePullPolicy`    | enum    | `IfNotPresent` or `Always`                                          |
+| `imagePullSecret`    | string  | Secret name for OCI registry authentication                         |
+
+### Examples
+
+<Tabs>
+  <Tab title="Global config">
+    Applies the `request-block` plugin to all routes, blocking requests containing `swagger.html`:
+
+    ```yaml
+    apiVersion: extensions.higress.io/v1alpha1
+    kind: WasmPlugin
+    metadata:
+      name: request-block
+      namespace: higress-system
+    spec:
+      url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/request-block:1.0.0
+      defaultConfig:
+        block_urls:
+        - "swagger.html"
+    ```
+  </Tab>
+  <Tab title="Route-level config">
+    Applies different block lists per ingress route while keeping a global default:
+
+    ```yaml
+    apiVersion: extensions.higress.io/v1alpha1
+    kind: WasmPlugin
+    metadata:
+      name: request-block
+      namespace: higress-system
+    spec:
+      url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/request-block:1.0.0
+      defaultConfig:
+        block_urls:
+        - "swagger.html"
+      matchRules:
+      - ingress:
+        - default/foo
+        config:
+          block_bodies:
+          - "foo"
+      - ingress:
+        - default/bar
+        config:
+          block_bodies:
+          - "bar"
+    ```
+  </Tab>
+  <Tab title="Domain-level config">
+    Applies a WAF plugin globally, with domain-scoped configuration:
+
+    ```yaml
+    apiVersion: extensions.higress.io/v1alpha1
+    kind: WasmPlugin
+    metadata:
+      name: waf
+      namespace: higress-system
+    spec:
+      url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/corazawaf:1.0.0
+      defaultConfig:
+        rules:
+        - "Include @crs-setup-conf"
+        - "Include @recommended-conf"
+        - "Include @owasp_crs/*.conf"
+        - "SecRuleEngine on"
+      matchRules:
+      - domain:
+        - "api.example.com"
+        config:
+          rules:
+          - "Include @crs-setup-conf"
+          - "SecRuleEngine DetectionOnly"
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## McpBridge CRD
+
+`McpBridge` (`networking.higress.io/v1`) integrates Higress with external service registries. The `McpBridge Controller` watches these resources and converts discovered services into Istio `ServiceEntry` objects, making them available as upstream backends for ingress routes.
+
+### Supported registry types
+
+<CardGroup cols={2}>
+  <Card title="Nacos 2.x" icon="server">
+    Cloud-native service registry by Alibaba. Use type `nacos2` for Nacos 2.0+, or `nacos` for 1.x.
+  </Card>
+  <Card title="Consul" icon="server">
+    HashiCorp service mesh and registry. Supports datacenter, namespace, service tag, and refresh interval.
+  </Card>
+  <Card title="Zookeeper" icon="server">
+    Apache ZooKeeper-based service discovery. Configure service paths via `zkServicesPath`.
+  </Card>
+  <Card title="DNS / Static" icon="globe">
+    Resolve services via DNS or configure static endpoints using the `domain` field.
+  </Card>
+</CardGroup>
+
+### Spec fields
+
+| Field                    | Type    | Description                                              |
+|--------------------------|---------|----------------------------------------------------------|
+| `registries`             | array   | List of registry configurations                          |
+| `registries[].name`      | string  | Unique identifier for this registry entry                |
+| `registries[].type`      | string  | Registry type: `nacos`, `nacos2`, `consul`, `zookeeper`  |
+| `registries[].domain`    | string  | IP or hostname of the registry server                    |
+| `registries[].port`      | integer | Port of the registry server                              |
+| `registries[].nacosGroups` | array | Nacos service groups to watch                          |
+| `registries[].nacosNamespaceId` | string | Nacos namespace ID (for multi-tenant setups)   |
+| `registries[].consulDatacenter` | string | Consul datacenter name                        |
+| `registries[].consulNamespace` | string | Consul namespace                               |
+| `registries[].consulServiceTag` | string | Filter services by Consul tag                |
+| `registries[].zkServicesPath` | array | ZooKeeper service tree paths to watch             |
+| `registries[].authSecretName` | string | Secret name containing registry auth credentials |
+| `proxies`                | array   | Optional proxy configurations for registry access        |
+
+### Example: Nacos 2.x
+
+```yaml
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: default
+  namespace: higress-system
+spec:
+  registries:
+  - domain: 192.168.3.32
+    nacosGroups:
+    - DEFAULT_GROUP
+    name: my-local-nacos
+    port: 8848
+    type: nacos2
+```
+
+Reference the McpBridge as the backend in an Ingress resource:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    higress.io/destination: service-provider.DEFAULT-GROUP.public.nacos
+  name: echo
+  namespace: default
+spec:
+  ingressClassName: higress
+  rules:
+  - http:
+      paths:
+      - backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+        path: /echo
+        pathType: Prefix
+```
+
+<Tip>
+The `higress.io/destination` annotation tells Higress which discovered service to route to. The format is `<service-name>.<group>.<namespace-id>.<registry-type>`.
+</Tip>

@@ -1,0 +1,383 @@
+---
+title: "Security"
+description: "Secure Higress routes with authentication, authorization, WAF, IP restrictions, and rate limiting."
+---
+
+Higress provides a layered security model. Authentication plugins validate caller identity, authorization rules control which callers can reach which routes, and protective plugins guard against malicious traffic and abuse.
+
+## Key Auth
+
+The `key-auth` plugin validates API keys supplied in request headers or URL parameters. Successful authentication adds `X-Mse-Consumer` to the forwarded request, identifying the caller.
+
+### Plugin execution
+
+- Phase: `Authentication Phase`
+- Priority: `321`
+
+### Configure consumers and keys
+
+Define consumers at the instance level. Each consumer has a `name` and a `credential` (the API key value). Specify which header or query parameter names to check using `keys`.
+
+```yaml
+# Instance-level configuration
+global_auth: false
+consumers:
+- name: service-a
+  credential: 2bda943c-ba2b-11ec-ba07-00163e1250b5
+- name: service-b
+  credential: c8c8e9ca-558e-4a2d-bb62-e700dcc40e35
+keys:
+- apikey
+- x-api-key
+in_header: true
+in_query: true
+```
+
+### Route-level authorization
+
+Restrict access to a specific route by listing allowed consumers:
+
+```yaml
+# Route-level configuration applied to route "my-api"
+allow:
+- service-a
+```
+
+### Making authenticated requests
+
+```bash
+# API key in request header
+curl http://api.example.com/my-api \
+  -H "x-api-key: 2bda943c-ba2b-11ec-ba07-00163e1250b5"
+
+# API key in URL parameter
+curl "http://api.example.com/my-api?apikey=2bda943c-ba2b-11ec-ba07-00163e1250b5"
+```
+
+After successful authentication, `X-Mse-Consumer: service-a` is added to the request forwarded to the backend.
+
+### Error responses
+
+| HTTP Status | Message | Reason |
+|---|---|---|
+| 401 | `Request denied by Key Auth check. No API key found in request` | No key provided |
+| 401 | `Request denied by Key Auth check. Invalid API key` | Key not recognized |
+| 401 | `Request denied by Key Auth check. Multiple API keys found in request` | More than one key present |
+| 403 | `Request denied by Key Auth check. Unauthorized consumer` | Key valid but consumer not in the route's allow list |
+
+## JWT Auth
+
+The `jwt-auth` plugin validates JSON Web Tokens. It extracts the JWT from configurable locations (headers, query parameters, cookies), verifies the signature against a JWK Set, and optionally forwards claims as upstream request headers.
+
+### Configure consumers
+
+```yaml
+# Instance-level configuration
+consumers:
+- name: my-consumer
+  issuer: "https://auth.example.com"
+  jwks: |
+    {
+      "keys": [
+        {
+          "kty": "RSA",
+          "use": "sig",
+          "kid": "my-key-id",
+          "n": "your-rsa-modulus",
+          "e": "AQAB"
+        }
+      ]
+    }
+  from_headers:
+  - name: Authorization
+    value_prefix: "Bearer "
+  from_params:
+  - access_token
+  clock_skew_seconds: 60
+  keep_token: true
+  claims_to_headers:
+  - claim: sub
+    header: X-User-Id
+    override: true
+  - claim: email
+    header: X-User-Email
+    override: true
+```
+
+### Route-level authorization
+
+```yaml
+# Route-level: allow only this consumer
+allow:
+- my-consumer
+```
+
+### Making authenticated requests
+
+```bash
+curl http://api.example.com/protected \
+  -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6Im..."
+```
+
+If `claims_to_headers` is configured, the backend receives the extracted claims as headers (e.g., `X-User-Id: user123`).
+
+## OIDC
+
+The `oidc` plugin integrates with any OpenID Connect provider. It handles the OAuth 2.0 authorization code flow, manages cookies, supports CSRF protection, and passes the access token upstream via the `Authorization` header.
+
+### Plugin execution
+
+- Phase: `Authentication Phase`
+- Priority: `350`
+
+### Basic configuration
+
+```yaml
+client_id: "your-oidc-client-id"
+client_secret: "your-oidc-client-secret"
+oidc_issuer_url: "https://dev-o43xb1mz7ya7ach4.us.auth0.com"
+redirect_url: "https://app.example.com/oauth2/callback"
+service_name: "auth0.dns"
+service_port: 443
+cookie_secret: "your-32-byte-base64-encoded-secret"
+scope: "openid email profile"
+```
+
+Generate a cookie secret:
+
+```bash
+python -c 'import os, base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())'
+```
+
+### Whitelist mode (bypass OIDC for specific paths)
+
+```yaml
+match_type: whitelist
+match_list:
+- match_rule_domain: "*.example.com"
+  match_rule_path: /public
+  match_rule_type: prefix
+```
+
+Requests matching this rule bypass OIDC validation. All other requests require authentication.
+
+### Logout
+
+Redirect users to `/oauth2/sign_out` to clear the session cookie. To also log the user out from the OIDC provider, include a redirect URL:
+
+```
+/oauth2/sign_out?rd=https%3A%2F%2Fmy-oidc-provider.example.com%2Fsign_out_page
+```
+
+## Basic Auth
+
+The `basic-auth` plugin implements HTTP Basic Authentication (RFC 7617). Credentials are `username:password` strings.
+
+### Plugin execution
+
+- Phase: `Authentication Phase`
+- Priority: `320`
+
+### Configure consumers
+
+```yaml
+# Instance-level configuration
+global_auth: false
+consumers:
+- name: admin
+  credential: "admin:securepassword123"
+- name: readonly
+  credential: "reader:readonlypass"
+```
+
+### Route-level authorization
+
+```yaml
+# Allow only admin on the admin route
+allow:
+- admin
+```
+
+### Making authenticated requests
+
+```bash
+# Using curl's -u flag
+curl -u admin:securepassword123 http://api.example.com/admin
+
+# Using the Authorization header directly (base64 of "admin:securepassword123")
+curl -H "Authorization: Basic YWRtaW46c2VjdXJlcGFzc3dvcmQxMjM=" \
+  http://api.example.com/admin
+```
+
+| HTTP Status | Message | Reason |
+|---|---|---|
+| 401 | `Request denied by Basic Auth check. No Basic Authentication information found.` | No credentials provided |
+| 401 | `Request denied by Basic Auth check. Invalid username and/or password.` | Wrong credentials |
+| 403 | `Request denied by Basic Auth check. Unauthorized consumer.` | Credentials valid but consumer not in allow list |
+
+## WAF
+
+The `waf` plugin provides a ModSecurity-based Web Application Firewall. It can enforce the OWASP Core Rule Set (CRS) and supports custom `SecRule` directives.
+
+### Plugin execution
+
+- Phase: `Authorization Phase`
+- Priority: `330`
+
+### Enable OWASP CRS with custom rules
+
+```yaml
+useCRS: true
+secRules:
+- "SecDebugLogLevel 3"
+- "SecRuleEngine On"
+- "SecAction \"id:100,phase:1,pass\""
+- "SecRule REQUEST_URI \"@streq /admin\" \"id:101,phase:1,t:lowercase,deny\""
+- "SecRule REQUEST_BODY \"@rx maliciouspayload\" \"id:102,phase:2,t:lowercase,deny\""
+```
+
+With this configuration, the following requests are blocked:
+
+```bash
+# Blocked: direct access to /admin
+curl http://example.com/admin
+
+# Blocked: request body contains the pattern "maliciouspayload"
+curl http://example.com/ -d "maliciouspayload"
+```
+
+<Note>
+`SecRules` follow the ModSecurity syntax. Refer to the [ModSecurity reference manual](http://www.modsecurity.cn/chm/) for the full rule language.
+</Note>
+
+## IP Restriction
+
+The `ip-restriction` plugin enforces IP-based access control using allow (whitelist) or deny (blocklist) lists. Both individual IPs and CIDR ranges are supported.
+
+### Plugin execution
+
+- Phase: `Authentication Phase`
+- Priority: `210`
+
+### Allowlist example
+
+```yaml
+ip_source_type: origin-source
+allow:
+- 10.0.0.1
+- 192.168.0.0/16
+- 203.0.113.42
+```
+
+Only requests from the listed IPs or ranges are permitted; all others receive `403`.
+
+### Blocklist example
+
+```yaml
+ip_source_type: origin-source
+deny:
+- 198.51.100.0/24
+- 10.0.0.5
+```
+
+### Trust a proxy header
+
+When Higress is behind a load balancer, use the `X-Forwarded-For` header as the IP source:
+
+```yaml
+ip_source_type: header
+ip_header_name: x-forwarded-for
+deny:
+- 198.51.100.0/24
+```
+
+### Custom denial response
+
+```yaml
+ip_source_type: origin-source
+deny:
+- 198.51.100.0/24
+status: 403
+message: "Access from your IP address is not permitted."
+```
+
+## HMAC Auth
+
+The `hmac-auth-apisix` plugin implements HMAC request signing. Clients compute an HMAC signature over request components (method, path, date, body hash) and include it in the `Authorization` header. The gateway verifies the signature using a shared secret.
+
+### Configure consumers
+
+```yaml
+consumers:
+- name: client-app
+  key: app-key-id
+  secret: "your-hmac-shared-secret"
+  clock_skew: 300
+```
+
+Clients must sign requests following the HMAC-SHA256 scheme. The `Authorization` header format is:
+
+```
+hmac-auth-v1 <key-id>:<nonce>:<timestamp>:<signature>
+```
+
+<Warning>
+Rotate HMAC secrets regularly and use clock skew limits (`clock_skew`) to prevent replay attacks. A `clock_skew` of `300` means requests older than 5 minutes are rejected.
+</Warning>
+
+## Rate Limiting
+
+The `cluster-key-rate-limit` plugin protects routes from excessive traffic. Limits can be keyed on any request attribute — header value, query parameter, consumer name, remote IP, or a fixed key for global limits.
+
+### Per-consumer rate limiting
+
+After applying `key-auth`, the consumer name is available in `X-Mse-Consumer`. Use that to apply per-consumer limits:
+
+```yaml
+limit_by_header: X-Mse-Consumer
+limit_keys:
+- key: service-a
+  query_per_second: 100
+  query_per_minute: 1000
+- key: service-b
+  query_per_second: 10
+  query_per_minute: 100
+```
+
+### Per-IP rate limiting
+
+```yaml
+limit_by_per_ip: true
+limit_keys:
+- key: 0.0.0.0/0
+  query_per_second: 20
+```
+
+### Global rate limiting
+
+```yaml
+limit_by_header: X-Mse-Consumer
+limit_keys: []
+# Fallback: global limit applied to all requests not matching a key
+query_per_second: 50
+```
+
+When a request exceeds the configured limit, the plugin returns `429 Too Many Requests`.
+
+## Combining security plugins
+
+Security plugins are applied in priority order. A typical layered setup for an AI API:
+
+```
+Request
+  │
+  ├─ [210] ip-restriction   — Block known bad IPs
+  ├─ [310] key-auth         — Validate API key, inject X-Mse-Consumer
+  ├─ [330] waf              — Block malicious patterns
+  └─ [rate-limit]           — Enforce per-consumer limits
+        │
+        ▼
+    Backend LLM
+```
+
+Apply each plugin as a separate `WasmPlugin` resource targeting the same Ingress, and configure route-level `allow` lists on the authentication plugins to control which consumers can access which routes.

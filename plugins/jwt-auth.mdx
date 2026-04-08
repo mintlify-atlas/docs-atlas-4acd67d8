@@ -1,0 +1,235 @@
+---
+title: "JWT Auth"
+description: "Authenticate API requests by validating JSON Web Tokens (JWT) using JWK sets."
+---
+
+The `jwt-auth` plugin validates JSON Web Tokens on incoming requests. It supports extracting the JWT from request headers, URL query parameters, or cookies, and can forward claims from the JWT payload to upstream services as request headers.
+
+**Execution phase:** Default Phase (UNSPECIFIED_PHASE)  
+**Execution priority:** `0`
+
+<Note>
+After successful authentication, the request header `X-Mse-Consumer` is added identifying the matched consumer name, and it is forwarded to the upstream service.
+</Note>
+
+<Warning>
+Authentication configuration (`consumers`) belongs at the instance (global) level. Authorization configuration (`allow`) belongs at the route or hostname level. They cannot coexist in a single rule.
+</Warning>
+
+## Configuration
+
+### Instance-level fields
+
+<ParamField path="consumers" type="object[]" required>
+  List of service consumers for JWT validation. Each consumer defines its own JWK set, issuer, and token extraction sources.
+</ParamField>
+
+<ParamField path="global_auth" type="boolean">
+  **Instance-level only.** When `true`, the authentication mechanism applies globally. When `false`, it only applies to routes or hostnames with an explicit `allow` configuration. If omitted, the plugin applies globally only when no route or hostname configurations exist.
+</ParamField>
+
+### Consumer object fields
+
+<ParamField path="name" type="string" required>
+  The name of this consumer. Referenced in route-level `allow` lists and set as the value of the `X-Mse-Consumer` header on authenticated requests.
+</ParamField>
+
+<ParamField path="jwks" type="string" required>
+  JSON string containing a JSON Web Key Set (JWKS) as defined in [RFC 7517](https://www.rfc-editor.org/rfc/rfc7517). Contains the public keys (or symmetric keys) used to verify JWT signatures.
+</ParamField>
+
+<ParamField path="issuer" type="string" required>
+  The expected JWT issuer. Must match the `iss` claim in the JWT payload.
+</ParamField>
+
+<ParamField path="from_headers" type="object[]">
+  List of request headers from which to extract the JWT. Each entry specifies a header `name` and a `value_prefix` to strip before treating the remainder as the token.
+
+  Default: `[{"name": "Authorization", "value_prefix": "Bearer "}]`
+
+  Only the default applies when none of `from_headers`, `from_params`, or `from_cookies` are configured.
+</ParamField>
+
+<ParamField path="from_params" type="string[]">
+  List of URL query parameter names from which to extract the JWT.
+
+  Default: `["access_token"]`
+
+  Only the default applies when none of `from_headers`, `from_params`, or `from_cookies` are configured.
+</ParamField>
+
+<ParamField path="from_cookies" type="string[]">
+  List of cookie names from which to extract the JWT.
+
+  Default: `[]`
+</ParamField>
+
+<ParamField path="claims_to_headers" type="object[]">
+  Extract fields from the JWT payload and forward them to the upstream service as request headers.
+</ParamField>
+
+<ParamField path="clock_skew_seconds" type="integer">
+  Allowed clock skew in seconds when validating the `exp` and `iat` claims.
+
+  Default: `60`
+</ParamField>
+
+<ParamField path="keep_token" type="boolean">
+  When `true`, the original JWT is kept in the request when forwarding to the upstream service. When `false`, the token is removed.
+
+  Default: `true`
+</ParamField>
+
+### `from_headers` entry fields
+
+<ParamField path="name" type="string" required>
+  The request header name to extract the JWT from.
+</ParamField>
+
+<ParamField path="value_prefix" type="string" required>
+  Prefix to strip from the header value. The remaining string is treated as the JWT. For example, with `value_prefix: "Bearer "`, the header `Authorization: Bearer <token>` yields `<token>`.
+</ParamField>
+
+### `claims_to_headers` entry fields
+
+<ParamField path="claim" type="string" required>
+  The JWT payload field name to extract. Must be a string or unsigned integer type.
+</ParamField>
+
+<ParamField path="header" type="string" required>
+  The request header name to set with the extracted claim value.
+</ParamField>
+
+<ParamField path="override" type="boolean">
+  When `true`, an existing header with the same name is overwritten. When `false`, the value is appended as an additional header.
+
+  Default: `true`
+</ParamField>
+
+### Route/hostname-level fields
+
+<ParamField path="allow" type="string[]">
+  **Route or hostname level only.** List of consumer names permitted to access this route or hostname. Authenticated requests whose consumer is not in this list are rejected with `403`.
+</ParamField>
+
+## Examples
+
+### Basic JWT validation
+
+Define a consumer with a JWKS and restrict access to a specific route.
+
+**Instance-level configuration:**
+
+```yaml
+global_auth: false
+consumers:
+  - name: consumer1
+    issuer: https://auth.example.com
+    jwks: >
+      {
+        "keys": [
+          {
+            "kty": "RSA",
+            "kid": "signing-key-1",
+            "use": "sig",
+            "n": "pjdss8ZaDfEH...",
+            "e": "AQAB"
+          }
+        ]
+      }
+```
+
+**Route-level configuration:**
+
+```yaml
+allow:
+  - consumer1
+```
+
+### Passing the JWT
+
+<Tabs>
+  <Tab title="Authorization header (default)">
+    ```bash
+    curl http://example.com/api \
+      -H 'Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InNpZ25pbmcta2V5LTEifQ...'
+    ```
+  </Tab>
+  <Tab title="URL query parameter">
+    ```bash
+    curl 'http://example.com/api?access_token=eyJhbGciOiJSUzI1NiIsImtpZCI6InNpZ25pbmcta2V5LTEifQ...'
+    ```
+  </Tab>
+  <Tab title="Custom header">
+    ```yaml
+    # Consumer configuration with custom header extraction
+    consumers:
+      - name: consumer1
+        issuer: https://auth.example.com
+        jwks: '{"keys": [...]}'
+        from_headers:
+          - name: X-Auth-Token
+            value_prefix: ""
+    ```
+  </Tab>
+</Tabs>
+
+### Claims extraction and forwarding
+
+Forward JWT payload fields to the upstream service as request headers:
+
+```yaml
+consumers:
+  - name: consumer1
+    issuer: https://auth.example.com
+    jwks: '{"keys": [...]}'
+    claims_to_headers:
+      - claim: sub
+        header: X-User-ID
+        override: true
+      - claim: email
+        header: X-User-Email
+        override: true
+      - claim: role
+        header: X-User-Role
+        override: false
+```
+
+With this configuration, a JWT containing `sub`, `email`, and `role` claims results in those values being forwarded to the upstream as `X-User-ID`, `X-User-Email`, and `X-User-Role` headers respectively.
+
+### Symmetric key (HMAC) example
+
+```yaml
+consumers:
+  - name: consumer-hmac
+    issuer: https://auth.example.com
+    jwks: >
+      {
+        "keys": [
+          {
+            "kty": "oct",
+            "kid": "hmac-key-1",
+            "k": "c2VjcmV0a2V5MTIzNDU2Nzg",
+            "alg": "HS256"
+          }
+        ]
+      }
+    clock_skew_seconds: 30
+    keep_token: false
+```
+
+<Tip>
+Setting `keep_token: false` removes the JWT before forwarding to the upstream service, which is useful when the upstream should not receive the raw token.
+</Tip>
+
+## Error codes
+
+| HTTP Status | Error message | Reason |
+|---|---|---|
+| `401` | `Request denied by JWT Auth check. JWT is missing.` | No JWT was found in any configured extraction source. |
+| `401` | `Request denied by JWT Auth check. JWT is expired.` | The JWT has expired (`exp` claim validation failed). |
+| `401` | `Request denied by JWT Auth check. JWT verification fails` | JWT signature verification failed, the issuer did not match, or the token is malformed. |
+| `403` | `Request denied by JWT Auth check. Unauthorized consumer.` | The matched consumer is not in the `allow` list for this route or hostname. |
+| `403` | `Request denied by JWT Auth check. JWT token not allow.` | No consumer matched the provided JWT. |
+
+Failed authentication also returns a `WWW-Authenticate: JWT realm=MSE Gateway` response header.
